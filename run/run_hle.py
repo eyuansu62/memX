@@ -170,6 +170,7 @@ def main():
             db_max_concurrency=4,
             sim_norm_mean=getattr(cfg.memory, 'sim_norm_mean', 0.1856827586889267),
             sim_norm_std=getattr(cfg.memory, 'sim_norm_std', 0.09407906234264374),
+            vector_dimension=cfg.embedding.vector_dimension,
         )
 
         sel = HLESelection(

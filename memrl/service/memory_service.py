@@ -296,6 +296,7 @@ class MemoryService:
         import threading
 
         self.db_max_concurrency: int = int(kwargs.get("db_max_concurrency", 4))
+        self._vector_dimension: int = int(kwargs.get("vector_dimension", 3072))
         self._db_gate = threading.BoundedSemaphore(self.db_max_concurrency)
         # Simple in-memory cache for loaded memories to reduce DB roundtrips
         self._mem_cache: dict[str, Any] = {}
@@ -378,7 +379,7 @@ class MemoryService:
                 "backend": "qdrant",
                 "config": {
                     "collection_name": f"memp_{self.user_id}_{ts_str}",
-                    "vector_dimension": 3072,
+                    "vector_dimension": self._vector_dimension,
                     "distance_metric": "cosine",
                     "path": qdrant_dir,
                 },
@@ -790,13 +791,23 @@ class MemoryService:
             raise RuntimeError(f"Failed to update Q-value: {e}")
 
 
-    def update_values(self, successes: list[float], retrieved_ids_list: list[list[str]]) -> dict[str, Optional[float]]:
+    def update_values(
+        self,
+        successes: list[float],
+        retrieved_ids_list: list[list[str]],
+        rewards: Optional[list[float]] = None,
+    ) -> dict[str, Optional[float]]:
         """
         Concurrently update Q-values for all retrieved memory_ids.
 
         Args:
-            successes: list of rewards (one per trajectory)
+            successes: list of bool/float (one per trajectory); used to map to
+                success_reward/failure_reward when `rewards` is not provided.
             retrieved_ids_list: list of lists of memory_ids (aligned with successes)
+            rewards: optional list of raw float rewards (one per trajectory).
+                When provided these are used directly, bypassing the
+                success_reward/failure_reward mapping.  Useful for blended
+                (env + LLM-judge) rewards.
 
         Returns:
             dict mapping memory_id -> new Q value (or None if failed).
@@ -809,13 +820,15 @@ class MemoryService:
 
         # Build update tasks: (memory_id, reward, next_max_q)
         updates = []
-        for success, mem_ids in zip(successes, retrieved_ids_list):
-            # Map success to 1 (True) or -1 (False/0)
-            reward = (
-                self.rl_config.success_reward
-                if success
-                else self.rl_config.failure_reward
-            )
+        for i, (success, mem_ids) in enumerate(zip(successes, retrieved_ids_list)):
+            if rewards is not None:
+                reward = float(rewards[i])
+            else:
+                reward = (
+                    self.rl_config.success_reward
+                    if success
+                    else self.rl_config.failure_reward
+                )
             for mem_id in mem_ids:
                 updates.append((mem_id, reward, None))
 
@@ -1837,7 +1850,7 @@ class MemoryService:
                         "backend": "qdrant",
                         "config": {
                             "collection_name": f"memp_{self.user_id}_snapshot",
-                            "vector_dimension": 3072,
+                            "vector_dimension": self._vector_dimension,
                             "distance_metric": "cosine",
                             "path": qdrant_dir,
                         },

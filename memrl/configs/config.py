@@ -48,6 +48,11 @@ class EmbeddingConfig(BaseModel):
         ge=0,
         description="Maximum characters per query before chunked embedding (0 disables chunking)",
     )
+    vector_dimension: int = Field(
+        default=3072,
+        gt=0,
+        description="Output dimension of the embedding model (must match actual model output)",
+    )
     
     @field_validator('api_key')
     @classmethod
@@ -187,6 +192,15 @@ class ExperimentConfig(BaseModel):
     ckpt_resume_epoch: Optional[int] = Field(default=None, description="Epoch index (1-based) to resume from")
     baseline_mode: Optional[str] = Field(default=None, description="Baseline mode: passk or reflection")
     baseline_k: int = Field(default=10, description="Baseline rounds (k) for pass@k/reflection")
+    # LLM-as-judge settings (ALFWorld)
+    use_llm_judge: bool = Field(default=False, description="Blend LLM judge score with env reward for Q-learning")
+    llm_judge_alpha: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Blend weight for judge score: final = (1-alpha)*env_reward + alpha*judge_score",
+    )
+
     # Output settings
     output_dir: str = Field(default="./results", description="Directory for experiment outputs")
     save_trajectories: bool = Field(default=True, description="Save detailed trajectories")

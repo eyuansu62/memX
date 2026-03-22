@@ -252,6 +252,7 @@ def main():
             use_z_score_normalization=bool(config.experiment.llb_use_z_score_normalization),
             # LLB-only: optionally deduplicate final top-k retrieved memories by task_id.
             dedup_by_task_id=bool(getattr(config.experiment, "llb_dedup_by_task_id", False)),
+            vector_dimension=config.embedding.vector_dimension,
         )
 
         # Load from checkpoint if configured

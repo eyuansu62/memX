@@ -16,6 +16,7 @@ from memrl.providers.llm import OpenAILLM
 from memrl.providers.embedding import OpenAIEmbedder
 from memrl.service.memory_service import MemoryService
 from memrl.service.strategies import BuildStrategy, RetrieveStrategy, UpdateStrategy, StrategyConfiguration
+from memrl.service.llm_judge import ALFWorldJudge
 from memrl.agent.memp_agent import MempAgent
 from memrl.run.alfworld_rl_runner import AlfworldRunner
 
@@ -153,11 +154,20 @@ def main():
             db_max_concurrency=4,
             sim_norm_mean=getattr(cfg.memory, "sim_norm_mean", None),
             sim_norm_std=getattr(cfg.memory, "sim_norm_std", None),
+            vector_dimension=cfg.embedding.vector_dimension,
         )
 
         with open(project_root / cfg.experiment.few_shot_path, "r", encoding="utf-8") as f:
             few_shot_examples = json.load(f)
         agent = MempAgent(llm_provider=llm_provider, few_shot_examples=few_shot_examples)
+
+        llm_judge = None
+        if getattr(cfg.experiment, "use_llm_judge", False):
+            llm_judge = ALFWorldJudge(llm=llm_provider)
+            logger.info(
+                "LLM-as-judge enabled (alpha=%.2f). Env reward will be blended with judge score.",
+                cfg.experiment.llm_judge_alpha,
+            )
 
         alfworld_config_path = project_root / "configs" / "envs" / "alfworld.yaml"
         runner = AlfworldRunner(
@@ -183,6 +193,8 @@ def main():
             ckpt_resume_epoch=getattr(cfg.experiment, "ckpt_resume_epoch", None),
             baseline_mode=getattr(cfg.experiment, "baseline_mode", None),
             baseline_k=getattr(cfg.experiment, "baseline_k", 10),
+            llm_judge=llm_judge,
+            llm_judge_alpha=getattr(cfg.experiment, "llm_judge_alpha", 0.3),
         )
         runner.run()
 

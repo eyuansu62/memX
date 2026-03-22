@@ -25,6 +25,7 @@ from memrl.agent.memp_agent import MempAgent
 from memrl.agent.history import EpisodeHistory
 from memrl.service.memory_service import MemoryService
 from memrl.service.value_driven import RLConfig
+from memrl.service.llm_judge import ALFWorldJudge
 from alfworld.agents.environment.alfred_tw_env import (  # type: ignore
     AlfredTWEnv,
     AlfredDemangler,
@@ -60,7 +61,8 @@ class AlfworldRunner(BaseRunner):
                  num_section: int, batch_size: int, max_steps: int, rl_config, ck_dir:str, retrieve_k: int=1, mode: str='train',
                  valid_interval: int=2, test_interval: int=2, dataset_ratio: float=1.0, random_seed: int=42, bon: int=0,
                  ckpt_resume_enabled: bool = False, ckpt_resume_path: Optional[str] = None, ckpt_resume_epoch: Optional[int] = None,
-                 baseline_mode: Optional[str] = None, baseline_k: int = 10):
+                 baseline_mode: Optional[str] = None, baseline_k: int = 10,
+                 llm_judge: Optional[ALFWorldJudge] = None, llm_judge_alpha: float = 0.3):
         self.agent = agent
         self.root = root
         self.memory_service = memory_service
@@ -83,7 +85,9 @@ class AlfworldRunner(BaseRunner):
         self.ckpt_resume_epoch = ckpt_resume_epoch
         self.baseline_mode = (baseline_mode or "").strip().lower() or None
         self.baseline_k = max(1, int(baseline_k))
-        
+        self.llm_judge: Optional[ALFWorldJudge] = llm_judge
+        self.llm_judge_alpha: float = float(llm_judge_alpha)
+
         self.rl_config: Optional[RLConfig] = rl_config
 
 
@@ -1067,8 +1071,37 @@ class AlfworldRunner(BaseRunner):
 
                 retrieved_queries = [traj["retrieved_queries"] for traj in collected_trajs]
 
+                # --- LLM-as-judge reward blending ---
+                blended_rewards: Optional[list] = None
+                if self.llm_judge is not None:
+                    logger.info(f"Running LLM judge on {len(collected_trajs)} trajectories...")
+                    judge_results = self.llm_judge.judge_batch(
+                        tasks=task_descriptions,
+                        trajectories=trajectories,
+                        env_successes=successes,
+                        max_workers=min(8, len(collected_trajs)),
+                    )
+                    blended_rewards = []
+                    for traj, jr in zip(collected_trajs, judge_results):
+                        env_r = (
+                            self.rl_config.success_reward if traj["success"]
+                            else self.rl_config.failure_reward
+                        )
+                        blended = (1.0 - self.llm_judge_alpha) * env_r + self.llm_judge_alpha * jr["score"]
+                        blended_rewards.append(blended)
+                        logger.debug(
+                            "Judge: env=%.1f judge=%.2f blended=%.2f | %s",
+                            env_r, jr["score"], blended, jr["reasoning"],
+                        )
+                    logger.info(
+                        "Judge blend done. Mean blended reward: %.3f",
+                        sum(blended_rewards) / len(blended_rewards),
+                    )
+
                 # update q value for retrieved mems
-                updated_q_list = self.memory_service.update_values(successes, retrieved_ids_list)
+                updated_q_list = self.memory_service.update_values(
+                    successes, retrieved_ids_list, rewards=blended_rewards
+                )
                 logger.info(f"Updated Q-values for mini-batch {i+1}: {updated_q_list}")
 
                 metadatas_update = [
