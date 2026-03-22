@@ -1089,6 +1089,8 @@ class AlfworldRunner(BaseRunner):
                         )
                         blended = (1.0 - self.llm_judge_alpha) * env_r + self.llm_judge_alpha * jr["score"]
                         blended_rewards.append(blended)
+                        traj["judge_score"] = jr["score"]
+                        traj["blended_reward"] = blended
                         logger.debug(
                             "Judge: env=%.1f judge=%.2f blended=%.2f | %s",
                             env_r, jr["score"], blended, jr["reasoning"],
@@ -1160,6 +1162,8 @@ class AlfworldRunner(BaseRunner):
                     "section": section_num,
                     "success": traj_data["success"],
                     "steps": traj_data["steps"],
+                    "judge_score": traj_data.get("judge_score", None),
+                    "blended_reward": traj_data.get("blended_reward", None),
                 })
 
             # --- [TENSORBOARD] Log training metrics for this section ---
