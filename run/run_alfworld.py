@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--max_tokens", type=int, default=None)
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Path to checkpoint snapshot dir. Implies mode=test (inference-only).")
     return p.parse_args()
 
 
@@ -169,6 +171,27 @@ def main():
                 cfg.experiment.llm_judge_alpha,
             )
 
+        # --checkpoint flag overrides config to force inference-only mode
+        ckpt_resume_enabled = getattr(cfg.experiment, "ckpt_resume_enabled", False)
+        ckpt_resume_path = getattr(cfg.experiment, "ckpt_resume_path", None)
+        ckpt_resume_epoch = getattr(cfg.experiment, "ckpt_resume_epoch", None)
+        run_mode = cfg.experiment.mode
+
+        if args.checkpoint:
+            ckpt_path = Path(args.checkpoint)
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"Checkpoint path not found: {args.checkpoint}")
+            run_mode = "test"
+            ckpt_resume_enabled = True
+            # If user points to a numbered snapshot dir (e.g. .../snapshot/8),
+            # extract the epoch; otherwise leave it to auto-detect.
+            if ckpt_path.name.isdigit():
+                ckpt_resume_epoch = int(ckpt_path.name)
+                ckpt_resume_path = str(ckpt_path.parent.parent)
+            else:
+                ckpt_resume_path = str(ckpt_path)
+            logger.info("Inference mode: loading checkpoint from %s (epoch=%s)", ckpt_resume_path, ckpt_resume_epoch)
+
         alfworld_config_path = project_root / "configs" / "envs" / "alfworld.yaml"
         runner = AlfworldRunner(
             agent=agent,
@@ -184,13 +207,13 @@ def main():
             rl_config=rl_config,
             bon=cfg.experiment.bon,
             retrieve_k=cfg.memory.k_retrieve,
-            mode=cfg.experiment.mode,
+            mode=run_mode,
             valid_interval=cfg.experiment.valid_interval,
             test_interval=cfg.experiment.test_interval,
             dataset_ratio=cfg.experiment.dataset_ratio,
-            ckpt_resume_enabled=getattr(cfg.experiment, "ckpt_resume_enabled", False),
-            ckpt_resume_path=getattr(cfg.experiment, "ckpt_resume_path", None),
-            ckpt_resume_epoch=getattr(cfg.experiment, "ckpt_resume_epoch", None),
+            ckpt_resume_enabled=ckpt_resume_enabled,
+            ckpt_resume_path=ckpt_resume_path,
+            ckpt_resume_epoch=ckpt_resume_epoch,
             baseline_mode=getattr(cfg.experiment, "baseline_mode", None),
             baseline_k=getattr(cfg.experiment, "baseline_k", 10),
             llm_judge=llm_judge,

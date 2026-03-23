@@ -1011,15 +1011,31 @@ class AlfworldRunner(BaseRunner):
                 self._run_reflection_baseline()
             self.writer.close()
             return
-        if self.mode != 'test': 
-            
-            logger.info("eval spilt")
-            if not skip_initial_eval:
-                self._evaluate(
-                        game_files=self.valid_game_files,
-                        eval_type="eval_in_distribution", 
-                        after_section=0
-                    )    
+
+        # --- Inference-only mode ---
+        if self.mode == 'test':
+            logger.info("Running in TEST (inference-only) mode.")
+            self._evaluate(
+                game_files=self.valid_game_files,
+                eval_type="eval_in_distribution",
+                after_section=0,
+            )
+            self._evaluate(
+                game_files=self.test_game_files,
+                eval_type="eval_out_of_distribution",
+                after_section=0,
+            )
+            self._analyze_and_report_results()
+            self.writer.close()
+            return
+
+        logger.info("eval spilt")
+        if not skip_initial_eval:
+            self._evaluate(
+                    game_files=self.valid_game_files,
+                    eval_type="eval_in_distribution",
+                    after_section=0
+                )
 
     # --- Loop: Iterate through Sections ---
         # 1. Prepare data splits
