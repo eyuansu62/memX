@@ -46,7 +46,7 @@ if str(LLB_ROOT) not in sys.path:
 
 # --- Import all our components ---
 from memrl.configs.config import MempConfig
-from memrl.service.memory_service import MemoryService
+from memrl.service.belief_memory_service import BeliefMemoryService, BeliefConfig
 from memrl.service.strategies import (
     BuildStrategy,
     RetrieveStrategy,
@@ -235,7 +235,7 @@ def main():
         logger.info("Config:\n%s", config.model_dump_json(indent=2))
 
         # 4. Initialize MemoryService with the config path and providers
-        memory_service = MemoryService(
+        memory_service = BeliefMemoryService(
             mos_config_path=mos_config_path,
             llm_provider=llm_provider,
             embedding_provider=embedding_provider,
@@ -253,6 +253,7 @@ def main():
             # LLB-only: optionally deduplicate final top-k retrieved memories by task_id.
             dedup_by_task_id=bool(getattr(config.experiment, "llb_dedup_by_task_id", False)),
             vector_dimension=config.embedding.vector_dimension,
+            belief_config=BeliefConfig(),
         )
 
         # Load from checkpoint if configured

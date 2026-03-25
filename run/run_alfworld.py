@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 from memrl.configs.config import MempConfig
 from memrl.providers.llm import OpenAILLM
 from memrl.providers.embedding import OpenAIEmbedder
-from memrl.service.memory_service import MemoryService
+from memrl.service.belief_memory_service import BeliefMemoryService, BeliefConfig
 from memrl.service.strategies import BuildStrategy, RetrieveStrategy, UpdateStrategy, StrategyConfiguration
 from memrl.service.llm_judge import ALFWorldJudge
 from memrl.agent.memp_agent import MempAgent
@@ -142,7 +142,7 @@ def main():
 
         user_id = f"alf_{os.getpid()}"
 
-        memory_service = MemoryService(
+        memory_service = BeliefMemoryService(
             mos_config_path=mos_config_path,
             llm_provider=llm_provider,
             embedding_provider=embedding_provider,
@@ -157,6 +157,7 @@ def main():
             sim_norm_mean=getattr(cfg.memory, "sim_norm_mean", None),
             sim_norm_std=getattr(cfg.memory, "sim_norm_std", None),
             vector_dimension=cfg.embedding.vector_dimension,
+            belief_config=BeliefConfig(),
         )
 
         with open(project_root / cfg.experiment.few_shot_path, "r", encoding="utf-8") as f:

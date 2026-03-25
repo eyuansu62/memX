@@ -1,0 +1,128 @@
+\section{Method}
+\label{sec:method}
+
+We propose \textbf{Belief-MemRL}, a lightweight extension of MemRL that augments each episodic memory with a \emph{belief posterior}---a memory-side statistical summary of past utility---and uses it to improve retrieval ranking, diversity, and credit assignment. Belief-MemRL preserves MemRL's core loop (build, retrieve, update) and modifies only three components: memory annotation at write time, retrieval scoring and selection at read time, and posterior updates after task completion.
+
+%---------------------------------------------------------------------
+\subsection{Belief-Augmented Memory Representation}
+\label{sec:belief-repr}
+
+In standard MemRL, each memory $m_i$ is stored with its text content and a scalar Q-value $Q_i$. We extend the metadata of each memory with a \emph{belief state} $b_i$:
+\begin{equation}
+  b_i = \bigl(\, \mathbf{e}_i^{\mathrm{belief}},\; \alpha_i,\; \beta_i,\; n_i^{\mathrm{reuse}},\; n_i^{\mathrm{conflict}},\; k_i \,\bigr),
+\end{equation}
+where $\mathbf{e}_i^{\mathrm{belief}} \in \mathbb{R}^d$ is the belief embedding, $(\alpha_i, \beta_i)$ are the parameters of a Beta posterior, $n_i^{\mathrm{reuse}}$ counts how many times the memory has been retrieved and used, $n_i^{\mathrm{conflict}}$ counts consecutive outcome reversals, and $k_i$ is a discrete belief key used for deduplication.
+
+\paragraph{Belief text extraction.}
+When a memory is created from a task description $t$ and trajectory $\tau$, we extract a structured \emph{belief text} by:
+\begin{enumerate}
+  \item Extracting goal terms: the top-$K_g$ (default 8) non-stopword tokens from $t$, ranked by frequency.
+  \item Extracting constraint lines: up to $K_c$ (default 4) sentences from $t$, $\tau$, or error messages that contain constraint markers (e.g., \texttt{must}, \texttt{should}, \texttt{avoid}, \texttt{error}, \texttt{fail}).
+  \item Composing a normalized text: \texttt{GOAL\_TERMS: $g_1, g_2, \ldots$ $\backslash$n CONSTRAINTS: $c_1 \| c_2 \| \ldots$}
+\end{enumerate}
+The belief embedding $\mathbf{e}_i^{\mathrm{belief}}$ is obtained by encoding this composed text through the embedding model. The belief key $k_i$ is formed by concatenating the top-4 goal terms and first 2 constraint fragments, providing a coarse semantic fingerprint of the memory.
+
+%---------------------------------------------------------------------
+\subsection{Belief-Augmented Retrieval}
+\label{sec:belief-retrieval}
+
+At retrieval time, given a new task description $t_q$, MemRL first produces a set of candidate memories $\mathcal{C}$ using its standard hybrid retrieval (keyword matching followed by Q-value filtering). Belief-MemRL then \emph{rescores} each candidate $m_i \in \mathcal{C}$ with a composite scoring function:
+
+\begin{equation}
+\label{eq:belief-score}
+  s(m_i, t_q) =
+    w_{\ell} \cdot s_i^{\mathrm{legacy}}
+  + w_{\mathrm{bs}} \cdot \mathrm{cos}\!\left(\mathbf{e}_q^{\mathrm{belief}},\, \mathbf{e}_i^{\mathrm{belief}}\right)
+  + w_{\mathrm{bp}} \cdot (2\bar{\mu}_i - 1)
+  + w_{\mathrm{ru}} \cdot \log_2(1 + n_i^{\mathrm{reuse}})
+  - w_{\mathrm{uc}} \cdot \sigma_i
+  - w_{\mathrm{cf}} \cdot r_i^{\mathrm{conflict}},
+\end{equation}
+
+where:
+\begin{itemize}
+  \item $s_i^{\mathrm{legacy}}$ is the original MemRL score (similarity $+$ Q-value);
+  \item $\mathbf{e}_q^{\mathrm{belief}}$ is the belief embedding of the query task $t_q$, computed using the same extraction procedure as at write time;
+  \item $\bar{\mu}_i = \alpha_i / (\alpha_i + \beta_i)$ is the posterior mean of the Beta distribution, centered to $[-1, 1]$;
+  \item $\sigma_i = \sqrt{\alpha_i \beta_i / \bigl((\alpha_i + \beta_i)^2 (\alpha_i + \beta_i + 1)\bigr)}$ is the posterior standard deviation;
+  \item $r_i^{\mathrm{conflict}} = n_i^{\mathrm{conflict}} / (n_i^{\mathrm{reuse}} + 1)$ is the conflict rate.
+\end{itemize}
+
+The default weights are $w_{\ell} = 0.45$, $w_{\mathrm{bs}} = 0.25$, $w_{\mathrm{bp}} = 0.20$, $w_{\mathrm{ru}} = 0.08$, $w_{\mathrm{uc}} = 0.08$, and $w_{\mathrm{cf}} = 0.10$.
+
+Each term serves a distinct role:
+\begin{enumerate}
+  \item \textbf{Belief similarity} ($w_{\mathrm{bs}}$): Matches the structural semantics (goals and constraints) between the query and memory, providing a noise-reduced similarity signal compared to raw text embedding similarity.
+  \item \textbf{Posterior mean} ($w_{\mathrm{bp}}$): Promotes memories with a strong track record of success and demotes those associated with failure.
+  \item \textbf{Reuse bonus} ($w_{\mathrm{ru}}$): Provides a logarithmic preference for well-tested memories over newly created ones.
+  \item \textbf{Uncertainty penalty} ($w_{\mathrm{uc}}$): Discourages retrieval of memories whose utility is still uncertain (low $\alpha_i + \beta_i$).
+  \item \textbf{Conflict penalty} ($w_{\mathrm{cf}}$): Penalizes memories whose outcomes oscillate between success and failure across consecutive retrievals, indicating unreliable or context-dependent utility.
+\end{enumerate}
+
+\paragraph{Belief-based deduplication.}
+After rescoring, standard top-$k$ selection may return multiple memories with similar belief keys (i.e., memories encoding the same task pattern). To promote diversity, Belief-MemRL applies \emph{belief deduplication}: when selecting the final top-$k$ memories, at most one memory per unique belief key $k_i$ is retained. This ensures the agent receives diverse strategic guidance rather than redundant variations of the same solution pattern.
+
+\paragraph{Ambiguity probe signal.}
+As an optional diagnostic, Belief-MemRL emits a binary \texttt{probe\_needed} flag when the top-two ranked memories satisfy all of the following: (1) their score gap is below a margin $\delta_{\mathrm{probe}}$ (default 0.15), (2) they have different belief keys, and (3) at least one has posterior uncertainty above $\sigma_{\mathrm{probe}}$ (default 0.22). This signal indicates that the memory system is uncertain about which strategy to recommend.
+
+%---------------------------------------------------------------------
+\subsection{Belief Posterior Update}
+\label{sec:belief-update}
+
+After task execution, MemRL updates Q-values via its standard temporal-difference rule. Belief-MemRL additionally updates the belief posterior of each retrieved memory $m_i$:
+
+\begin{equation}
+\label{eq:belief-update}
+  \alpha_i \leftarrow \alpha_i + \mathbb{1}[\text{success}], \qquad
+  \beta_i  \leftarrow \beta_i  + \mathbb{1}[\text{failure}],
+\end{equation}
+\begin{equation}
+  n_i^{\mathrm{reuse}} \leftarrow n_i^{\mathrm{reuse}} + 1,
+\end{equation}
+\begin{equation}
+  n_i^{\mathrm{conflict}} \leftarrow n_i^{\mathrm{conflict}} + \mathbb{1}\!\bigl[\text{outcome} \neq \text{last\_outcome}(m_i)\bigr].
+\end{equation}
+
+The Beta posterior $\mathrm{Beta}(\alpha_i, \beta_i)$ provides a Bayesian estimate of memory utility that is complementary to Q-learning:
+
+\begin{itemize}
+  \item \textbf{Q-learning} uses a fixed step size $\alpha_{\mathrm{lr}}$ (e.g., 0.3), making it responsive but volatile---a single failure after several successes can reduce the Q-value substantially.
+  \item \textbf{Beta posterior} accumulates counts, making it robust to isolated outliers. After $n$ successes and 1 failure, the posterior mean is $n/(n+2)$, which degrades gracefully rather than collapsing.
+\end{itemize}
+
+By combining both signals in the retrieval score (Eq.~\ref{eq:belief-score}), the system benefits from Q-learning's fast adaptation and the posterior's statistical stability.
+
+%---------------------------------------------------------------------
+\subsection{Dual Indexing}
+\label{sec:dual-index}
+
+In addition to MemRL's standard keyword-based memory index, Belief-MemRL optionally indexes each memory under its belief text as a second retrieval key. This means a memory about ``heat a potato and place it on the countertop'' can be retrieved both by its original task description \emph{and} by its belief text \texttt{GOAL\_TERMS: hot, potato, countertop, microwave}. Dual indexing improves recall for semantically related but lexically different queries. Duplicate candidates arising from dual indexing are merged by memory ID before rescoring, retaining only the highest-scoring entry per memory.
+
+%---------------------------------------------------------------------
+\subsection{Summary of Modifications}
+\label{sec:summary}
+
+Table~\ref{tab:modifications} summarizes the three modification points relative to MemRL.
+
+\begin{table}[h]
+\centering
+\caption{Belief-MemRL modifications to the MemRL pipeline.}
+\label{tab:modifications}
+\begin{tabular}{lll}
+\toprule
+\textbf{Phase} & \textbf{MemRL} & \textbf{Belief-MemRL} \\
+\midrule
+Build  & Store memory with Q-init & + Annotate belief state $(b_i)$ \\
+       &                          & + Dual-index by belief text \\
+\midrule
+Retrieve & Rank by sim $+$ Q & + Rescore with 6-term belief score \\
+         & Top-$k$ selection  & + Belief-based deduplication \\
+         &                    & + Ambiguity probe signal \\
+\midrule
+Update & Q-learning update & + Beta posterior update \\
+       &                   & + Conflict tracking \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All modifications are implemented as a subclass of \texttt{MemoryService} with no changes to the agent, environment interface, or benchmark runners. The belief layer adds six float-valued metadata fields per memory and requires one additional embedding call per retrieval query.

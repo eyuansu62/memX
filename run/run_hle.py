@@ -12,7 +12,7 @@ sys.path.insert(0, str(project_root))
 from memrl.configs.config import MempConfig
 from memrl.providers.llm import OpenAILLM
 from memrl.providers.embedding import OpenAIEmbedder
-from memrl.service.memory_service import MemoryService
+from memrl.service.belief_memory_service import BeliefMemoryService, BeliefConfig
 from memrl.service.strategies import BuildStrategy, RetrieveStrategy, UpdateStrategy, StrategyConfiguration
 from memrl.run.hle_runner import HLERunner, HLESelection
 
@@ -152,7 +152,7 @@ def main():
         with open(mos_config_path, "w", encoding="utf-8") as f:
             _json.dump(mos_config, f)
 
-        memsvc = MemoryService(
+        memsvc = BeliefMemoryService(
             mos_config_path=mos_config_path,
             llm_provider=llm,
             embedding_provider=embedder,
@@ -171,6 +171,7 @@ def main():
             sim_norm_mean=getattr(cfg.memory, 'sim_norm_mean', 0.1856827586889267),
             sim_norm_std=getattr(cfg.memory, 'sim_norm_std', 0.09407906234264374),
             vector_dimension=cfg.embedding.vector_dimension,
+            belief_config=BeliefConfig(),
         )
 
         sel = HLESelection(

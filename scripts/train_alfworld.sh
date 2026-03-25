@@ -8,9 +8,9 @@
 set -e
 
 # ── paths & binaries ─────────────────────────────────────────────────────────
-PYTHON=/home/qinbowen/miniconda3/envs/memrl/bin/python
-VLLM=/home/qinbowen/miniconda3/envs/dschat/bin/vllm
-PROJECT=/home/qinbowen/MemRL
+PYTHON=/home/qinbowen/miniconda3/envs/memoryrl/bin/python
+VLLM=/home/qinbowen/miniconda3/envs/memoryrl/bin/vllm
+PROJECT=/home/qinbowen/memX
 HF_HOME=/huggingface
 
 # ── LLM server (tensor parallel across 2 GPUs) ──────────────────────────────
@@ -25,8 +25,8 @@ LLM_LOG=/tmp/vllm_llm.log
 EMBED_MODEL=/home/qinbowen/models/Qwen3-Embedding-4B
 EMBED_PORT=8001
 EMBED_NAME=Qwen3-Embedding-4B
-EMBED_GPU=0,1
-EMBED_TP=2
+EMBED_GPU=1
+EMBED_TP=1
 EMBED_LOG=/tmp/vllm_embed.log
 
 # ── Training ─────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=$LLM_GPU HF_HOME=$HF_HOME $VLLM serve $LLM_MODEL \
     --port $LLM_PORT \
     --served-model-name $LLM_NAME \
     --tensor-parallel-size $LLM_TP \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.75 \
     > $LLM_LOG 2>&1 &
 LLM_PID=$!
 echo "[$(date +%T)] LLM server PID: $LLM_PID"
@@ -79,7 +79,8 @@ CUDA_VISIBLE_DEVICES=$EMBED_GPU HF_HOME=$HF_HOME $VLLM serve $EMBED_MODEL \
     --port $EMBED_PORT \
     --served-model-name $EMBED_NAME \
     --tensor-parallel-size $EMBED_TP \
-    --gpu-memory-utilization 0.09 \
+    --gpu-memory-utilization 0.15 \
+    --max-model-len 4096 \
     --enforce-eager \
     > $EMBED_LOG 2>&1 &
 EMBED_PID=$!
