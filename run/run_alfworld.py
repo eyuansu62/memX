@@ -15,7 +15,10 @@ from memrl.configs.config import MempConfig
 from memrl.providers.llm import OpenAILLM
 from memrl.providers.embedding import OpenAIEmbedder
 from memrl.service.belief_memory_service import BeliefMemoryService, BeliefConfig
+from memrl.service.memory_service import MemoryService
 from memrl.service.strategies import BuildStrategy, RetrieveStrategy, UpdateStrategy, StrategyConfiguration
+from memrl.analysis.logged_services import LoggedMemoryService, LoggedBeliefMemoryService
+from memrl.analysis.memory_logger import MemoryEventLogger
 from memrl.service.llm_judge import ALFWorldJudge
 from memrl.agent.memp_agent import MempAgent
 from memrl.run.alfworld_rl_runner import AlfworldRunner
@@ -56,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_tokens", type=int, default=None)
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Path to checkpoint snapshot dir. Implies mode=test (inference-only).")
+    p.add_argument("--memory_service", type=str, default="belief",
+                   choices=["belief", "original"],
+                   help="Which memory service to use: 'belief' (BeliefMemoryService) or 'original' (MemoryService).")
+    p.add_argument("--log_path", type=str, default=None,
+                   help="Path to JSONL event log file. Enables diagnostic logging when set.")
     return p.parse_args()
 
 
@@ -142,7 +150,7 @@ def main():
 
         user_id = f"alf_{os.getpid()}"
 
-        memory_service = BeliefMemoryService(
+        common_svc_kwargs = dict(
             mos_config_path=mos_config_path,
             llm_provider=llm_provider,
             embedding_provider=embedding_provider,
@@ -157,8 +165,20 @@ def main():
             sim_norm_mean=getattr(cfg.memory, "sim_norm_mean", None),
             sim_norm_std=getattr(cfg.memory, "sim_norm_std", None),
             vector_dimension=cfg.embedding.vector_dimension,
-            belief_config=BeliefConfig(),
         )
+        use_belief = getattr(args, "memory_service", "belief") != "original"
+        if use_belief:
+            SvcClass = LoggedBeliefMemoryService if args.log_path else BeliefMemoryService
+            memory_service = SvcClass(**common_svc_kwargs, belief_config=BeliefConfig())
+        else:
+            SvcClass = LoggedMemoryService if args.log_path else MemoryService
+            memory_service = SvcClass(**common_svc_kwargs)
+
+        if args.log_path:
+            log_path = Path(args.log_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            memory_service._mem_event_logger = MemoryEventLogger(str(log_path))
+            logger.info("Memory event logging enabled → %s", log_path)
 
         with open(project_root / cfg.experiment.few_shot_path, "r", encoding="utf-8") as f:
             few_shot_examples = json.load(f)

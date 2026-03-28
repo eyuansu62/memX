@@ -105,6 +105,23 @@ score = 0.45·legacy + 0.25·belief_sim + 0.20·(2μ-1) + 0.08·log(1+n_reuse) -
 
 ---
 
+## OOD Inference — Qwen3-30B-A3B-FP8 (2026-03-28)
+
+Cross-model OOD test: load BeliefMemRL snapshot 10 (built by Qwen3-4B) and run inference with a larger model (Qwen3-30B-A3B-FP8). Tests whether belief-annotated memories transfer across model scales.
+
+| Eval Set | SR | Avg Steps | Notes |
+|----------|----|-----------|-------|
+| In-distribution (140 games) | 51.43% (72/140) | 18.97 | Same as training eval |
+| **Out-of-distribution** (134 games) | **59.70%** (80/134) | **17.53** | Unseen task types |
+
+- OOD SR (+8.27pp above in-dist) and avg steps (−1.44) are both better on unseen tasks
+- Memories encode structural patterns (GOAL_TERMS, CONSTRAINTS) rather than model-specific text — they transfer effectively to a 30B model
+- The 30B model leverages the belief-ranked memories more efficiently: fewer steps on OOD tasks suggests cleaner action selection with higher-quality retrieved context
+- **Script:** `scripts/test_belief_ood.sh`, **Config:** `configs/rl_alf_config.qwen30b_ood.local.yaml`
+- **Results CSV:** `logs/experiment_results_alfworld_belief_ood_20260328-174919.csv`
+
+---
+
 ## Implementation Notes
 
 - `memrl/service/belief_memory_service.py` — `BeliefMemoryService(MemoryService)` subclass, no changes to agent or runners beyond import swap

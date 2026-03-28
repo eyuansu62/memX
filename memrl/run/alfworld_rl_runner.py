@@ -1049,6 +1049,11 @@ class AlfworldRunner(BaseRunner):
 
             logger.info("\n" + "#"*20 + f" STARTING SECTION {section_num}/{self.num_section}" + "#"*20)
 
+            # Notify event logger of current epoch
+            _ev_log = getattr(getattr(self, "memory_service", None), "_mem_event_logger", None)
+            if _ev_log is not None:
+                _ev_log.set_epoch(section_num)
+
             section_trajectories = []
 
             # --- Inner Loop: Iterate through mini-batches (environments) ---
