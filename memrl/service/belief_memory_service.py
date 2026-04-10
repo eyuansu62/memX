@@ -1051,6 +1051,10 @@ class BeliefMemoryService(MemoryService):
             }
         """
         raw = self.retrieve_query(task_description, k=k, threshold=threshold)
+        # retrieve_query may return (result_dict, sim_list) tuple
+        if isinstance(raw, tuple):
+            raw, _ = raw
+        raw = dict(raw or {})
         candidates = raw.get("selected", []) or raw.get("candidates", [])
 
         active = []

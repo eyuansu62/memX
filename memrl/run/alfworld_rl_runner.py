@@ -63,7 +63,7 @@ class AlfworldRunner(BaseRunner):
                  ckpt_resume_enabled: bool = False, ckpt_resume_path: Optional[str] = None, ckpt_resume_epoch: Optional[int] = None,
                  baseline_mode: Optional[str] = None, baseline_k: int = 10,
                  llm_judge: Optional[ALFWorldJudge] = None, llm_judge_alpha: float = 0.3,
-                 state_first: bool = True):
+                 state_first: bool = False):
         self.agent = agent
         self.root = root
         self.memory_service = memory_service
@@ -441,7 +441,7 @@ class AlfworldRunner(BaseRunner):
         current_bs = mini_batch_env.batch_size
         active_slots = list(range(current_bs))
         messages_per_slot: List[List[Dict]] = [[] for _ in range(current_bs)]
-        steps_per_slot: List[List[Dict]] = [0 for _ in range(current_bs)]
+        steps_per_slot: List[int] = [0 for _ in range(current_bs)]
 
         results = mini_batch_env.reset()
         current_task_descs = ['\n'.join(res['obs'].split('\n\n')[1:]) for res in results]
@@ -770,7 +770,7 @@ class AlfworldRunner(BaseRunner):
         current_bs = mini_batch_env.batch_size
         active_slots = list(range(current_bs))
         messages_per_slot: List[List[Dict]] = [[] for _ in range(current_bs)]
-        steps_per_slot: List[List[Dict]] = [0 for _ in range(current_bs)]
+        steps_per_slot: List[int] = [0 for _ in range(current_bs)]
 
         results = mini_batch_env.reset()
         current_task_descs = ['\n'.join(res['obs'].split('\n\n')[1:]) for res in results]
@@ -1215,6 +1215,7 @@ class AlfworldRunner(BaseRunner):
             for traj_data in section_trajectories:
                 self.results_log.append({
                     "section": section_num,
+                    "mode": "update",
                     "success": traj_data["success"],
                     "steps": traj_data["steps"],
                     "judge_score": traj_data.get("judge_score", None),
