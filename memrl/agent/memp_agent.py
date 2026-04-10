@@ -187,6 +187,55 @@ class MempAgent(BaseAgent):
         # logger.info(f"\nPrompt {messages}")
         return messages
 
+    def _construct_messages_state_first(
+        self,
+        task_description: str,
+        state_prompt: str,
+        task_type: str,
+        raw_memories: dict = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Build message list using compiled state as PRIMARY context.
+        Raw retrieved memories are included as truncated fallback evidence only.
+        """
+        messages = [{"role": "system", "content": prompts.SYSTEM_PROMPT}]
+
+        # Few-shot example
+        example_dialogue = self._get_examples_for_task(task_type)
+        if example_dialogue:
+            example_dialogue[0]['content'] = "Here is an example of how to solve the task:\n" + example_dialogue[0]['content']
+            messages.extend(example_dialogue)
+
+        # State-first context: compiled operating state
+        if state_prompt and state_prompt.strip():
+            state_context = (
+                "Below is your current operating state — a pre-processed summary of your "
+                "relevant memories, ranked by reliability and relevance. Use this as your "
+                "primary decision context:\n\n" + state_prompt
+            )
+            messages.append({"role": "system", "content": state_context})
+
+        # Optional: raw memories as fallback (truncated)
+        if raw_memories:
+            successful_mems = raw_memories.get('successed', [])
+            if successful_mems:
+                truncated = []
+                for mem in successful_mems[:2]:  # at most 2 raw memories as backup
+                    content = self._format_retrieved_memory(mem.get('content', ''))
+                    if content:
+                        truncated.append(content[:300] + "..." if len(content) > 300 else content)
+                if truncated:
+                    fallback = (
+                        "Supporting evidence from raw memory (for reference only):\n" +
+                        "\n---\n".join(truncated)
+                    )
+                    messages.append({"role": "system", "content": fallback})
+
+        # Current task
+        current_task_prompt = f"Now, it's your turn to solve a new task.\n{task_description}"
+        messages.append({"role": "user", "content": current_task_prompt})
+        return messages
+
     def _parse_action(self, llm_response: str) -> str:
         """
         Extracts the 'Action:' part from the ReAct response.

@@ -7,6 +7,7 @@ to implement the Build/Retrieve/Update memory management strategies.
 
 import logging
 import random
+import re
 import time
 import math
 import statistics
@@ -101,6 +102,7 @@ logger = logging.getLogger(__name__)
 from ..providers.base import BaseLLM, BaseEmbedder
 
 from .value_driven import RLConfig, ValueAwareSelector, QValueUpdater, MemoryCurator
+from .budget import BudgetManager
 
 
 def _now_iso() -> str:
@@ -455,6 +457,21 @@ class MemoryService:
             except Exception:
                 # Fail gracefully; callers can still use baseline flows
                 self.enable_value_driven = False
+
+        # Budget enforcement (optional; disabled when memory_budget == 0)
+        memory_budget = int(kwargs.get("memory_budget", 0))
+        self._budget_manager: Optional[BudgetManager] = None
+        if memory_budget > 0:
+            self._budget_manager = BudgetManager(
+                budget=memory_budget,
+                policy=str(kwargs.get("budget_policy", "q_weighted")),
+                check_interval=int(kwargs.get("budget_check_interval", 1)),
+                utilization_threshold=float(kwargs.get("budget_utilization_threshold", 0.8)),
+            )
+            logger.info(
+                f"Budget enforcement enabled: B={memory_budget}, "
+                f"policy={self._budget_manager.policy}"
+            )
 
     def _init_key_generators(self) -> None:
         """Initialize key generators for retrieval strategies."""
@@ -1092,6 +1109,18 @@ class MemoryService:
             "confidence": self.memory_confidence,
             "full_content": full_content,
         }
+        # Expiry / lifecycle metadata
+        base_meta["created_at"] = datetime.now().isoformat()
+        base_meta["expired"] = False
+        default_ttl = int(kwargs.get("ttl_epochs", 0)) if kwargs else 0
+        if default_ttl <= 0:
+            # Check instance-level default
+            bm = getattr(self, "_budget_manager", None)
+            default_ttl = int(kwargs.get("default_ttl_epochs", 0)) if kwargs else 0
+        base_meta["ttl_epochs"] = default_ttl if default_ttl > 0 else None
+        base_meta["created_epoch"] = int(kwargs.get("current_epoch", 0)) if kwargs else 0
+        base_meta["protected"] = False
+
         if (
             getattr(self, "enable_value_driven", False)
             and getattr(self, "rl_config", None) is not None
@@ -1349,6 +1378,11 @@ class MemoryService:
 
                         if mem_obj is not None:
                             md = getattr(mem_obj, "metadata", {})
+                            # Filter expired memories from retrieval
+                            md_dict = _meta_to_dict(md)
+                            if md_dict.get("expired", False):
+                                continue
+
                             content = None
                             try:
                                 if hasattr(md, "model_extra"):
@@ -1669,6 +1703,9 @@ class MemoryService:
                                     exc_info=True,
                                 )
 
+            # Enforce budget after adding new memories
+            self._enforce_budget()
+
             return results
 
         except Exception as e:
@@ -1676,6 +1713,403 @@ class MemoryService:
 
             print(f"[add_memories] Error: {e}\n{traceback.format_exc()}")
             return {}
+
+    # ------------------------------------------------------------------
+    # Budget enforcement
+    # ------------------------------------------------------------------
+
+    def get_memory_count(self) -> int:
+        """Return the current number of memories in the store."""
+        try:
+            res = self.mos.get_all(user_id=self.user_id)
+            if isinstance(res, dict):
+                items = res.get("text", [])
+            elif isinstance(res, list):
+                items = res
+            else:
+                items = []
+            return len(items)
+        except Exception:
+            logger.warning("Failed to count memories", exc_info=True)
+            return 0
+
+    def get_all_memories_with_metadata(self) -> List[Dict[str, Any]]:
+        """Return all memories as dicts with memory_id and metadata for budget scoring."""
+        results = []
+        try:
+            cube_id = getattr(self, "default_cube_id", None)
+            cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+            if cube is None:
+                return results
+            text_mem = cube.text_mem
+            if text_mem is None:
+                return results
+            all_items = text_mem.get_all()
+            for item in all_items:
+                meta = _meta_to_dict(getattr(item, "metadata", {}))
+                # Also check for q_value in q_cache
+                mem_id = str(getattr(item, "memory_id", ""))
+                if mem_id in self._q_cache:
+                    meta["q_value"] = self._q_cache[mem_id]
+                results.append({
+                    "memory_id": mem_id,
+                    "metadata": meta,
+                })
+        except Exception:
+            logger.warning("Failed to get all memories for budget", exc_info=True)
+        return results
+
+    def delete_memories(self, memory_ids: List[str], reason: str = "budget_eviction") -> int:
+        """Delete memories by ID from MemOS storage.
+
+        Args:
+            memory_ids: List of memory IDs to delete.
+            reason: Reason string for logging.
+
+        Returns:
+            Number of successfully deleted memories.
+        """
+        if not memory_ids:
+            return 0
+        try:
+            cube_id = getattr(self, "default_cube_id", None)
+            cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+            if cube is None or cube.text_mem is None:
+                logger.error("Cannot delete: no active text_mem.")
+                return 0
+            cube.text_mem.delete(memory_ids)
+            # Emit log events
+            _ev_log = getattr(self, "_mem_event_logger", None)
+            if _ev_log is not None:
+                for mid in memory_ids:
+                    _ev_log.log_delete(memory_id=mid, reason=reason)
+            # Clean up caches
+            for mid in memory_ids:
+                self._q_cache.pop(mid, None)
+                self._mem_cache.pop(mid, None)
+            # Clean up dict_memory references
+            for query_key in list(self.dict_memory.keys()):
+                orig = self.dict_memory[query_key]
+                filtered = [m for m in orig if m not in memory_ids]
+                if not filtered:
+                    del self.dict_memory[query_key]
+                    self.query_embeddings.pop(query_key, None)
+                elif len(filtered) < len(orig):
+                    self.dict_memory[query_key] = filtered
+            logger.info(f"Deleted {len(memory_ids)} memories (reason={reason}): {memory_ids}")
+            return len(memory_ids)
+        except Exception:
+            logger.error(f"Failed to delete memories: {memory_ids}", exc_info=True)
+            return 0
+
+    def redact_memories(
+        self,
+        memory_ids: List[str],
+        patterns: List[str],
+        replacement: str = "[REDACTED]",
+        source: str = "explicit",
+    ) -> Dict[str, int]:
+        """Redact sensitive content from memories by applying pattern-based replacement.
+
+        This is the *Redact* state-transition operator: it modifies memory content
+        in-place while preserving structural utility (belief key, metadata, Q-value).
+
+        Args:
+            memory_ids: List of memory IDs to redact.
+            patterns: Regex patterns to match against memory text.
+            replacement: Replacement string for matched content.
+            source: Who triggered the redaction (for logging).
+
+        Returns:
+            Dict mapping memory_id -> number of replacements applied.
+        """
+        if not memory_ids or not patterns:
+            return {}
+
+        compiled = []
+        for pat in patterns:
+            try:
+                compiled.append(re.compile(pat, re.IGNORECASE))
+            except re.error:
+                logger.warning("Skipping invalid redact pattern: %s", pat)
+
+        if not compiled:
+            return {}
+
+        results: Dict[str, int] = {}
+        try:
+            cube_id = getattr(self, "default_cube_id", None)
+            cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+            if cube is None or cube.text_mem is None:
+                logger.error("Cannot redact: no active text_mem.")
+                return {}
+            text_mem = cube.text_mem
+        except Exception:
+            logger.error("Cannot redact: failed to access text_mem.", exc_info=True)
+            return {}
+
+        for mid in memory_ids:
+            try:
+                mem = text_mem.get(mid)
+                if mem is None:
+                    continue
+                content = mem.get("memory", "") if isinstance(mem, dict) else str(mem)
+                total_subs = 0
+                new_content = content
+                for rx in compiled:
+                    new_content, n = rx.subn(replacement, new_content)
+                    total_subs += n
+
+                if total_subs > 0:
+                    text_mem.update(mid, {"id": mid, "memory": new_content})
+                    self._mem_cache.pop(mid, None)
+                    # Mark as redacted in metadata (via _patch_metadata if available, else direct)
+                    if hasattr(self, "_patch_metadata"):
+                        self._patch_metadata(mid, {"redacted": True})
+                    else:
+                        try:
+                            meta = text_mem.get_metadata(mid)
+                            if isinstance(meta, dict):
+                                meta["redacted"] = True
+                                text_mem.update_metadata(mid, meta)
+                        except Exception:
+                            pass  # metadata update is best-effort
+
+                results[mid] = total_subs
+
+                # Log
+                _ev_log = getattr(self, "_mem_event_logger", None)
+                if _ev_log is not None:
+                    _ev_log.log_redact(
+                        memory_id=mid,
+                        n_patterns=len(compiled),
+                        n_replacements=total_subs,
+                        source=source,
+                    )
+            except Exception:
+                logger.warning("Failed to redact memory %s", mid, exc_info=True)
+                results[mid] = 0
+
+        total = sum(results.values())
+        if total > 0:
+            logger.info(
+                "Redacted %d substitutions across %d memories (source=%s)",
+                total, len([v for v in results.values() if v > 0]), source,
+            )
+        return results
+
+    def redact_by_entity(
+        self,
+        entity_value: str,
+        entity_type: str = "unknown",
+        replacement: str = "[REDACTED]",
+    ) -> Dict[str, int]:
+        """Redact all occurrences of a specific entity across all memories.
+
+        Higher-level API wrapping ``redact_memories``. Useful for removing
+        PII, API keys, file paths, etc.
+
+        Args:
+            entity_value: The literal string to redact (will be regex-escaped).
+            entity_type: Label for logging (e.g., "username", "api_key").
+            replacement: Replacement string.
+
+        Returns:
+            Dict mapping memory_id -> number of replacements applied.
+        """
+        pattern = re.escape(entity_value)
+        all_ids = []
+        try:
+            all_mems = self._get_all_memories()
+            all_ids = [m.get("memory_id") or m.get("id", "") for m in all_mems if m]
+        except Exception:
+            logger.error("Failed to enumerate memories for entity redaction.")
+            return {}
+
+        if not all_ids:
+            return {}
+
+        return self.redact_memories(
+            memory_ids=all_ids,
+            patterns=[pattern],
+            replacement=f"[{entity_type.upper()}_REDACTED]" if entity_type != "unknown" else replacement,
+            source=f"entity:{entity_type}",
+        )
+
+    def _enforce_budget(self) -> int:
+        """Check budget and evict low-value memories if over limit.
+
+        Returns:
+            Number of memories evicted.
+        """
+        if self._budget_manager is None:
+            return 0
+        if not self._budget_manager.should_check():
+            return 0
+
+        current_count = self.get_memory_count()
+        if not self._budget_manager.needs_eviction(current_count):
+            return 0
+
+        n_to_evict = current_count - self._budget_manager.budget
+        all_memories = self.get_all_memories_with_metadata()
+
+        evict_ids = self._budget_manager.select_eviction_candidates(
+            all_memories, n_to_evict
+        )
+        if evict_ids:
+            # Emit evict log events before deletion (so we capture metadata)
+            _ev_log = getattr(self, "_mem_event_logger", None)
+            if _ev_log is not None:
+                meta_by_id = {m["memory_id"]: m.get("metadata", {}) for m in all_memories}
+                for mid in evict_ids:
+                    meta = meta_by_id.get(mid, {})
+                    _ev_log.log_evict(
+                        memory_id=mid,
+                        policy=self._budget_manager.policy,
+                        q_value=float(meta.get("q_value", 0.0)),
+                        belief_alpha=float(meta.get("belief_alpha", 1.0)),
+                        belief_beta=float(meta.get("belief_beta", 1.0)),
+                    )
+            deleted = self.delete_memories(evict_ids, reason="budget_eviction")
+            logger.info(
+                f"Budget enforcement: evicted {deleted}/{n_to_evict} memories "
+                f"(count was {current_count}, budget={self._budget_manager.budget})"
+            )
+            return deleted
+        return 0
+
+    # ------------------------------------------------------------------
+    # Expire operator
+    # ------------------------------------------------------------------
+
+    def expire_stale_memories(self, current_epoch: int) -> int:
+        """Mark memories as expired if they have exceeded their TTL.
+
+        Expired memories are soft-deleted (filtered from retrieval) but remain
+        in storage. They are hard-deleted first when budget pressure requires eviction.
+
+        Args:
+            current_epoch: The current epoch number.
+
+        Returns:
+            Number of memories newly marked as expired.
+        """
+        all_memories = self.get_all_memories_with_metadata()
+        expired_count = 0
+
+        cube_id = getattr(self, "default_cube_id", None)
+        cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+        if cube is None or cube.text_mem is None:
+            return 0
+
+        for m in all_memories:
+            meta = m.get("metadata", {})
+            if meta.get("expired", False):
+                continue  # already expired
+
+            ttl = meta.get("ttl_epochs")
+            if ttl is None or ttl <= 0:
+                continue  # no TTL set
+
+            created_epoch = int(meta.get("created_epoch", 0))
+            if current_epoch - created_epoch >= ttl:
+                # Mark as expired via metadata patch
+                self._patch_memory_metadata(m["memory_id"], {"expired": True})
+                expired_count += 1
+                logger.info(
+                    f"Expired memory {m['memory_id']} "
+                    f"(created_epoch={created_epoch}, ttl={ttl}, current={current_epoch})"
+                )
+                # Emit log event
+                _ev_log = getattr(self, "_mem_event_logger", None)
+                if _ev_log is not None:
+                    _ev_log.log_expire(
+                        memory_id=m["memory_id"],
+                        created_epoch=created_epoch,
+                        ttl_epochs=int(ttl),
+                        current_epoch=current_epoch,
+                    )
+
+        return expired_count
+
+    def begin_epoch(self, epoch: int) -> Dict[str, int]:
+        """Lifecycle hook called at the start of each epoch.
+
+        Runs expire checks and budget enforcement.
+
+        Args:
+            epoch: The current epoch number (1-based).
+
+        Returns:
+            Dict with counts: {"expired": N, "evicted": M}
+        """
+        expired = self.expire_stale_memories(epoch)
+        evicted = self._enforce_budget()
+        if expired > 0 or evicted > 0:
+            logger.info(
+                f"begin_epoch({epoch}): expired={expired}, evicted={evicted}"
+            )
+        return {"expired": expired, "evicted": evicted}
+
+    def _patch_memory_metadata(self, memory_id: str, patch: Dict[str, Any]) -> None:
+        """Update specific metadata fields for a memory item in-place."""
+        try:
+            cube_id = getattr(self, "default_cube_id", None)
+            cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+            if cube is None or cube.text_mem is None:
+                return
+
+            # Get the memory item, update metadata, and re-add
+            items = cube.text_mem.get_all()
+            for item in items:
+                if str(getattr(item, "memory_id", getattr(item, "id", ""))) == str(memory_id):
+                    meta = _meta_to_dict(getattr(item, "metadata", {}))
+                    meta.update(patch)
+                    try:
+                        item.metadata = TextualMemoryMetadata(**meta)
+                    except Exception:
+                        # If metadata model rejects extra fields, update via model_extra
+                        for k, v in patch.items():
+                            try:
+                                setattr(item.metadata, k, v)
+                            except Exception:
+                                pass
+                    # Re-upsert the item (MemOS vector DB should handle upsert by ID)
+                    try:
+                        cube.text_mem.vector_db.upsert([item])
+                    except AttributeError:
+                        # Fallback: delete + re-add
+                        cube.text_mem.delete([str(memory_id)])
+                        cube.text_mem.add([item])
+                    break
+        except Exception:
+            logger.warning(f"Failed to patch metadata for {memory_id}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Delete operator (public API)
+    # ------------------------------------------------------------------
+
+    def delete_by_predicate(
+        self,
+        predicate_fn,
+        reason: str = "predicate",
+    ) -> int:
+        """Delete all memories matching a predicate function.
+
+        Args:
+            predicate_fn: Callable(Dict[str, Any]) -> bool. Receives memory dict
+                with "memory_id" and "metadata" keys.
+            reason: Reason string for logging.
+
+        Returns:
+            Number of deleted memories.
+        """
+        all_memories = self.get_all_memories_with_metadata()
+        to_delete = [m["memory_id"] for m in all_memories if predicate_fn(m)]
+        if to_delete:
+            return self.delete_memories(to_delete, reason=reason)
+        return 0
 
     def save_checkpoint_snapshot(self, target_ck_dir: str, ckpt_id: str) -> dict:
         """

@@ -89,6 +89,16 @@ class MemoryConfig(BaseModel):
     sim_norm_mean: float = Field(default=0, description="Mean for similarity normalization")
     sim_norm_std: float = Field(default=0, description="Standard deviation for similarity normalization")
 
+    # Memory budget enforcement
+    memory_budget: int = Field(default=0, ge=0, description="Maximum number of memories allowed (0 = unlimited)")
+    budget_policy: str = Field(default="q_weighted", description="Eviction policy when budget exceeded: q_weighted, fifo, lru, posterior")
+    budget_check_interval: int = Field(default=1, ge=1, description="Check budget every N memory additions")
+    budget_utilization_threshold: float = Field(default=0.8, ge=0, le=1, description="Budget utilization ratio above which Refine is preferred over Create")
+
+    # Memory expiry
+    default_ttl_epochs: Optional[int] = Field(default=None, description="Default TTL in epochs for new memories (None = no expiry)")
+    expire_check_on_retrieve: bool = Field(default=True, description="Check and mark expired memories during retrieval")
+
     # Optional checkpoint loading for runners that support resuming memory state.
     load_from_checkpoint: bool = Field(default=False, description="Whether to load memory state from a checkpoint snapshot")
     checkpoint_path: Optional[str] = Field(default=None, description="Path to a memory checkpoint snapshot to load (if enabled)")
@@ -201,6 +211,9 @@ class ExperimentConfig(BaseModel):
         description="Blend weight for judge score: final = (1-alpha)*env_reward + alpha*judge_score",
     )
 
+    # State-first execution
+    state_first: bool = Field(default=False, description="Use state-first agent interface (compiled state as primary context)")
+
     # Output settings
     output_dir: str = Field(default="./results", description="Directory for experiment outputs")
     save_trajectories: bool = Field(default=True, description="Save detailed trajectories")
@@ -239,6 +252,62 @@ class RLConfig(BaseModel):
     weight_sim: float = Field(default=0.5, description="Weight for similarity in combined score")
     weight_q: float = Field(default=0.5, description="Weight for Q-value in combined score")
 
+
+class BeliefConfigModel(BaseModel):
+    """Configuration for the belief-augmented memory layer (BeliefMemoryService).
+
+    All defaults match the dataclass ``BeliefConfig`` in
+    ``memrl.service.belief_memory_service`` so existing code keeps working
+    if the YAML has no ``belief:`` section.
+    """
+
+    # Retrieval score weights (must sum to ~1 for interpretability).
+    weight_legacy: float = Field(default=0.45, description="Weight for legacy MemRL retrieval score")
+    weight_belief_similarity: float = Field(default=0.25, description="Weight for belief-key similarity term")
+    weight_belief_posterior: float = Field(default=0.20, description="Weight for posterior mean term")
+    weight_reuse_bonus: float = Field(default=0.08, description="Weight for reuse bonus")
+    weight_uncertainty_penalty: float = Field(default=0.08, description="Weight for uncertainty penalty")
+    weight_conflict_penalty: float = Field(default=0.10, description="Weight for conflict-rate penalty")
+
+    # Posterior prior.
+    prior_alpha: float = Field(default=1.0, ge=0, description="Beta prior alpha (pseudo-successes)")
+    prior_beta: float = Field(default=1.0, ge=0, description="Beta prior beta (pseudo-failures)")
+
+    # Belief extraction controls.
+    max_goal_terms: int = Field(default=8, gt=0, description="Max keywords for belief key extraction")
+    max_constraint_lines: int = Field(default=4, gt=0, description="Max constraint lines in belief text")
+    max_error_chars: int = Field(default=240, gt=0, description="Max chars for error text in belief")
+    index_belief_text: bool = Field(default=True, description="Index belief text as secondary retrieval key")
+    dedup_by_belief: bool = Field(default=True, description="Keep at most one memory per belief_key in selection")
+    dedup_by_memory_id: bool = Field(default=True, description="Merge duplicate candidates from dual indexing")
+
+    # Ambiguity flagging.
+    probe_margin: float = Field(default=0.15, description="Top-2 score gap below which retrieval is ambiguous")
+    probe_uncertainty: float = Field(default=0.22, description="Uncertainty threshold for ambiguity flag")
+
+    # Update strength.
+    success_step: float = Field(default=1.0, ge=0, description="Posterior increment on success")
+    failure_step: float = Field(default=1.0, ge=0, description="Posterior increment on failure")
+
+    # Auto-refine triggers.
+    auto_refine_conflict_threshold: float = Field(default=0.5, ge=0, le=1, description="Conflict rate above which auto-refine fires")
+    auto_refine_min_reuse: int = Field(default=3, ge=1, description="Minimum reuse events before auto-refine eligible")
+
+    def to_dataclass(self):
+        """Convert to the ``BeliefConfig`` dataclass expected by BeliefMemoryService.
+
+        Uses a lazy import so that this module can be loaded without pulling in
+        the full MemoryOS dependency tree (e.g. for config validation scripts).
+        If the import fails, returns the Pydantic model itself — both expose the
+        same attribute names so ``BeliefMemoryService.__init__`` works either way.
+        """
+        try:
+            from memrl.service.belief_memory_service import BeliefConfig
+            return BeliefConfig(**self.model_dump())
+        except Exception:
+            return self  # fallback: attribute-compatible
+
+
 class MempConfig(BaseModel):
     """Main configuration class for the Memp system."""
     
@@ -249,6 +318,7 @@ class MempConfig(BaseModel):
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
     rl_config: RLConfig = Field(default_factory=RLConfig)
+    belief: BeliefConfigModel = Field(default_factory=BeliefConfigModel)
     # Global settings
     project_name: str = Field(default="memp", description="Project name")
     version: str = Field(default="0.1.0", description="Project version")

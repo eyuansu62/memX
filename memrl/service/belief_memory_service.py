@@ -94,6 +94,10 @@ class BeliefConfig:
     success_step: float = 1.0
     failure_step: float = 1.0
 
+    # Auto-refine trigger: when conflict_rate exceeds this, trigger posterior reset.
+    auto_refine_conflict_threshold: float = 0.5
+    auto_refine_min_reuse: int = 3  # only trigger after this many reuse events
+
 
 class BeliefMemoryService(MemoryService):
     """
@@ -331,7 +335,50 @@ class BeliefMemoryService(MemoryService):
                 self.query_embeddings[belief_text] = vec
 
     # ---------------------------------------------------------------------
-    # Write path: keep MemRL add_memories, then annotate memory-side beliefs.
+    # Write routing: decide Create vs Refine based on budget pressure
+    # ---------------------------------------------------------------------
+    def _find_similar_memory(
+        self,
+        task_description: str,
+        trajectory: str,
+        sim_threshold: float = 0.75,
+    ) -> Optional[str]:
+        """Find an existing memory similar to this task, for write routing.
+
+        Returns memory_id if a similar memory exists, None otherwise.
+        """
+        # Use belief key overlap as a fast similarity proxy
+        new_belief = self._compose_belief_text(task_description, trajectory)
+        new_key = new_belief.get("belief_key", "")
+        if not new_key or new_key == "generic":
+            return None
+
+        new_terms = set(new_belief.get("belief_terms", []))
+        if not new_terms:
+            return None
+
+        best_id: Optional[str] = None
+        best_overlap = 0.0
+
+        # Check existing memories via belief text cache
+        for mid, btext in self._belief_text_cache.items():
+            # Extract terms from cached belief text
+            existing_terms = set(self._tokenize(btext)) - _STOPWORDS
+            if not existing_terms:
+                continue
+            intersection = new_terms & existing_terms
+            union = new_terms | existing_terms
+            overlap = len(intersection) / max(len(union), 1)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_id = mid
+
+        if best_overlap >= sim_threshold and best_id is not None:
+            return best_id
+        return None
+
+    # ---------------------------------------------------------------------
+    # Write path: route to Refine or Create, then annotate belief metadata.
     # ---------------------------------------------------------------------
     def add_memories(
         self,
@@ -342,22 +389,100 @@ class BeliefMemoryService(MemoryService):
         retrieved_memory_ids_list: Optional[List[Optional[List[str]]]] = None,
         metadatas: Optional[List[Optional[Dict[str, Any]]]] = None,
     ) -> Any:
-        results = super().add_memories(
-            task_descriptions=task_descriptions,
-            trajectories=trajectories,
-            successes=successes,
-            retrieved_memory_queries=retrieved_memory_queries,
-            retrieved_memory_ids_list=retrieved_memory_ids_list,
-            metadatas=metadatas,
-        )
+        # ----- Write routing: check budget pressure -----
+        bm = getattr(self, "_budget_manager", None)
+        routed_to_refine: Dict[int, str] = {}  # index -> existing memory_id
 
-        normalized = self._normalize_add_results(results, task_descriptions)
+        if bm is not None:
+            try:
+                mem_count = self.get_memory_count()
+            except Exception:
+                mem_count = 0
+
+            if bm.should_prefer_refine(mem_count):
+                for i, (td, traj) in enumerate(zip(task_descriptions, trajectories)):
+                    similar_id = self._find_similar_memory(td, traj)
+                    if similar_id is not None:
+                        routed_to_refine[i] = similar_id
+
+        # ----- Separate items into Create vs Refine paths -----
+        create_indices = [i for i in range(len(task_descriptions)) if i not in routed_to_refine]
+
+        # Handle Refine-routed items: update existing memory instead of creating new
+        refine_results: Dict[str, Optional[str]] = {}
+        for i, existing_mid in routed_to_refine.items():
+            td = task_descriptions[i]
+            traj = trajectories[i]
+            succ = successes[i]
+            try:
+                self.refine_memory(
+                    existing_mid,
+                    trigger="write_routing",
+                    reset_posterior=False,
+                    new_trajectory=traj,
+                    task_description=td,
+                    success=succ,
+                )
+                refine_results[td] = existing_mid
+            except Exception:
+                # Fall back to Create if Refine fails
+                create_indices.append(i)
+
+        # ----- Create path: delegate to parent for remaining items -----
+        if create_indices:
+            create_tds = [task_descriptions[i] for i in create_indices]
+            create_trajs = [trajectories[i] for i in create_indices]
+            create_succs = [successes[i] for i in create_indices]
+            create_queries = [
+                (retrieved_memory_queries or [None] * len(task_descriptions))[i]
+                for i in create_indices
+            ]
+            create_ids = [
+                (retrieved_memory_ids_list or [None] * len(task_descriptions))[i]
+                for i in create_indices
+            ]
+            create_metas = [
+                (metadatas or [None] * len(task_descriptions))[i]
+                for i in create_indices
+            ]
+
+            create_results = super().add_memories(
+                task_descriptions=create_tds,
+                trajectories=create_trajs,
+                successes=create_succs,
+                retrieved_memory_queries=create_queries,
+                retrieved_memory_ids_list=create_ids,
+                metadatas=create_metas,
+            )
+        else:
+            create_results = {}
+
+        # ----- Merge results back into original order -----
+        # Normalize create_results
+        if create_indices:
+            normalized_create = self._normalize_add_results(create_results, [task_descriptions[i] for i in create_indices])
+        else:
+            normalized_create = []
+
+        # Build combined results
+        all_results: Dict[str, Optional[str]] = {}
+        create_idx = 0
+        for i in range(len(task_descriptions)):
+            td = task_descriptions[i]
+            if i in routed_to_refine:
+                all_results[td] = refine_results.get(td)
+            elif create_idx < len(normalized_create):
+                _, mid = normalized_create[create_idx]
+                all_results[td] = mid
+                create_idx += 1
+
+        # ----- Annotate belief metadata on all entries -----
         metas = list(metadatas or [None] * len(task_descriptions))
-
-        for i, (task_text, memory_id) in enumerate(normalized):
+        for i in range(len(task_descriptions)):
+            td = task_descriptions[i]
+            memory_id = all_results.get(td)
             if not memory_id:
                 continue
-            td = task_descriptions[i] if i < len(task_descriptions) else task_text
             traj = trajectories[i] if i < len(trajectories) else ""
             succ = bool(successes[i]) if i < len(successes) else True
             meta = dict(metas[i] or {})
@@ -365,7 +490,6 @@ class BeliefMemoryService(MemoryService):
             belief = self._compose_belief_text(td, traj, meta)
             patch = {
                 **belief,
-                # Store a Beta-posterior style memory-side utility statistic.
                 "belief_alpha": float(meta.get("belief_alpha", self.belief_config.prior_alpha + (1.0 if succ else 0.0))),
                 "belief_beta": float(meta.get("belief_beta", self.belief_config.prior_beta + (0.0 if succ else 1.0))),
                 "belief_reuse": float(meta.get("belief_reuse", 0.0)),
@@ -385,7 +509,7 @@ class BeliefMemoryService(MemoryService):
                 if self.belief_config.index_belief_text:
                     self._index_belief_text(memory_id, belief_text)
 
-        return results
+        return all_results
 
     # ---------------------------------------------------------------------
     # Read path: rerank MemRL candidates with memory-side belief statistics.
@@ -539,9 +663,11 @@ class BeliefMemoryService(MemoryService):
         conflict = float(meta.get("belief_conflict", 0.0))
 
         last_outcome = str(meta.get("belief_last_outcome", "") or "").strip().lower()
+        conflict_detected = False
         if last_outcome:
             if (last_outcome == "success" and not success) or (last_outcome == "failure" and success):
                 conflict += 1.0
+                conflict_detected = True
 
         if success:
             alpha += float(self.belief_config.success_step)
@@ -558,6 +684,244 @@ class BeliefMemoryService(MemoryService):
         patch["belief_score"] = alpha / max(alpha + beta, 1e-8)
         self._patch_metadata(memory_id, patch)
 
+        # Check auto-refine trigger: high conflict rate after sufficient reuse
+        cfg = self.belief_config
+        conflict_rate = conflict / max(reuse, 1.0)
+        if (
+            conflict_detected
+            and reuse >= cfg.auto_refine_min_reuse
+            and conflict_rate >= cfg.auto_refine_conflict_threshold
+        ):
+            self.refine_memory(memory_id, trigger="auto_conflict")
+
+    def _detect_cross_memory_conflicts(
+        self,
+        retrieved_ids: List[str],
+        success: bool,
+    ) -> List[Tuple[str, str]]:
+        """Detect conflicts between memories with the same belief_key but opposite outcomes.
+
+        Returns list of (memory_id_a, memory_id_b) conflict pairs.
+        """
+        by_key: Dict[str, List[Tuple[str, str]]] = {}  # belief_key -> [(mem_id, last_outcome)]
+        for mid in retrieved_ids:
+            if not mid:
+                continue
+            try:
+                item = self._read_memory(mid)
+                meta = _meta_to_dict(getattr(item, "metadata", None))
+                bkey = str(meta.get("belief_key", ""))
+                last = str(meta.get("belief_last_outcome", ""))
+                if bkey:
+                    by_key.setdefault(bkey, []).append((mid, last))
+            except Exception:
+                continue
+
+        conflicts: List[Tuple[str, str]] = []
+        for bkey, entries in by_key.items():
+            successes = [e for e in entries if e[1] == "success"]
+            failures = [e for e in entries if e[1] == "failure"]
+            if successes and failures:
+                conflicts.append((successes[0][0], failures[0][0]))
+        return conflicts
+
+    _REFINE_PROMPT_TEMPLATE = (
+        "You are revising a stored memory entry to make it more accurate and general.\n\n"
+        "## Original Memory Content\n{old_content}\n\n"
+        "## Belief Key\n{belief_key}\n\n"
+        "{new_evidence_section}"
+        "## Instructions\n"
+        "Rewrite the memory to incorporate the new evidence. "
+        "Keep the same format and level of detail. "
+        "If the new trajectory contradicts the old content, prefer the newer information. "
+        "Output ONLY the revised memory text, no commentary."
+    )
+
+    def _llm_rewrite_content(
+        self,
+        old_content: str,
+        belief_key: str,
+        new_trajectory: Optional[str] = None,
+        task_description: Optional[str] = None,
+        success: Optional[bool] = None,
+    ) -> Optional[str]:
+        """Call LLM to rewrite memory content with new evidence."""
+        llm = getattr(self, "llm_provider", None)
+        if llm is None or not callable(getattr(llm, "generate", None)):
+            return None
+
+        evidence_parts = []
+        if task_description:
+            evidence_parts.append(f"Task: {task_description[:500]}")
+        if new_trajectory:
+            evidence_parts.append(f"New trajectory:\n{new_trajectory[:1500]}")
+        if success is not None:
+            evidence_parts.append(f"Outcome: {'success' if success else 'failure'}")
+
+        if evidence_parts:
+            new_evidence_section = "## New Evidence\n" + "\n".join(evidence_parts) + "\n\n"
+        else:
+            new_evidence_section = ""
+
+        prompt = self._REFINE_PROMPT_TEMPLATE.format(
+            old_content=old_content[:2000],
+            belief_key=belief_key[:200],
+            new_evidence_section=new_evidence_section,
+        )
+
+        try:
+            revised = llm.generate([{"role": "user", "content": prompt}], max_tokens=1024)
+            revised = str(revised or "").strip()
+            if revised and len(revised) > 20:
+                return revised
+        except Exception:
+            pass
+        return None
+
+    def refine_memory(
+        self,
+        memory_id: str,
+        trigger: str = "belief_instability",
+        reset_posterior: bool = True,
+        new_trajectory: Optional[str] = None,
+        task_description: Optional[str] = None,
+        success: Optional[bool] = None,
+    ) -> None:
+        """Refine operator: rewrite content and/or reset unstable posterior.
+
+        Called automatically when conflict_rate exceeds threshold, via write
+        routing under budget pressure, or explicitly by external intervention.
+
+        Args:
+            memory_id: Target memory to refine.
+            trigger: What caused the refinement.
+            reset_posterior: If True, soft-reset Beta posterior counts.
+            new_trajectory: New trajectory to incorporate (for content rewrite).
+            task_description: Task description for context (for content rewrite).
+            success: Task outcome (for content rewrite).
+        """
+        item = self._read_memory(memory_id)
+        meta = _meta_to_dict(getattr(item, "metadata", None))
+        cfg = self.belief_config
+
+        old_alpha = float(meta.get("belief_alpha", cfg.prior_alpha))
+        old_beta = float(meta.get("belief_beta", cfg.prior_beta))
+        q_val = float(getattr(self, "_q_cache", {}).get(memory_id, 0.0))
+        old_content = str(getattr(item, "memory", "") or "")
+        belief_key = str(meta.get("belief_key", ""))
+
+        # ----- Content rewrite via LLM -----
+        content_rewritten = False
+        if new_trajectory or trigger in ("write_routing", "successful_divergence"):
+            revised = self._llm_rewrite_content(
+                old_content=old_content,
+                belief_key=belief_key,
+                new_trajectory=new_trajectory,
+                task_description=task_description,
+                success=success,
+            )
+            if revised is not None:
+                try:
+                    text_mem = self._get_text_mem()
+                    text_mem.update(memory_id, {
+                        "id": memory_id,
+                        "memory": revised,
+                        "metadata": meta,
+                    })
+                    self._mem_cache.pop(memory_id, None)
+                    content_rewritten = True
+                except Exception:
+                    pass
+
+        # ----- Posterior soft-reset -----
+        patch: Dict[str, Any] = {}
+        if reset_posterior:
+            new_alpha = max(cfg.prior_alpha, old_alpha * 0.5)
+            new_beta = max(cfg.prior_beta, old_beta * 0.5)
+            patch["belief_alpha"] = new_alpha
+            patch["belief_beta"] = new_beta
+            patch["belief_score"] = new_alpha / max(new_alpha + new_beta, 1e-8)
+            patch["belief_conflict"] = 0.0
+
+        # Recompute belief key if content was rewritten
+        if content_rewritten and task_description:
+            new_belief = self._compose_belief_text(task_description, new_trajectory or "")
+            patch["belief_key"] = new_belief.get("belief_key", belief_key)
+            patch["belief_text"] = new_belief.get("belief_text", "")
+            patch["belief_terms"] = new_belief.get("belief_terms", [])
+
+        if patch:
+            self._patch_metadata(memory_id, patch)
+
+        # Log the refine event
+        _ev_log = getattr(self, "_mem_event_logger", None)
+        if _ev_log is not None:
+            _ev_log.log_refine(
+                memory_id=memory_id,
+                trigger=trigger,
+                q_value=q_val,
+                belief_alpha=float(patch.get("belief_alpha", old_alpha)),
+                belief_beta=float(patch.get("belief_beta", old_beta)),
+                posterior_reset=reset_posterior,
+                content_rewritten=content_rewritten,
+            )
+
+    def intervene(
+        self,
+        memory_id: str,
+        operator: str = "refine",
+        source: str = "external",
+        new_text: Optional[str] = None,
+        reset_posterior: bool = False,
+        metadata_patch: Optional[Dict[str, Any]] = None,
+        redact_patterns: Optional[List[str]] = None,
+    ) -> None:
+        """External intervention operator: correct a memory with immediate effect.
+
+        This supports the paper's "intervention-ready" property — operators can be
+        externally triggered (e.g., by a human or a monitoring system).
+
+        Args:
+            memory_id: Target memory to intervene on.
+            operator: Type of intervention ("refine", "override", "delete", "redact").
+            source: Who triggered it ("external", "human", "monitor").
+            new_text: If provided, replace the memory text (for override).
+            reset_posterior: If True, reset belief posterior to prior.
+            metadata_patch: Additional metadata to patch.
+            redact_patterns: Regex patterns to redact (required when operator="redact").
+        """
+        if operator == "delete":
+            self.delete_memories([memory_id], reason=f"intervention:{source}")
+        elif operator == "redact":
+            self.redact_memories(
+                memory_ids=[memory_id],
+                patterns=redact_patterns or [],
+                source=f"intervention:{source}",
+            )
+        elif operator == "refine":
+            self.refine_memory(memory_id, trigger=f"intervention:{source}", reset_posterior=reset_posterior)
+        elif operator == "override" and new_text is not None:
+            # Replace memory content
+            try:
+                text_mem = self._get_text_mem()
+                text_mem.update(memory_id, {"id": memory_id, "memory": new_text})
+                self._mem_cache.pop(memory_id, None)
+            except Exception:
+                pass
+
+        # Apply optional metadata patch
+        if metadata_patch:
+            self._patch_metadata(memory_id, metadata_patch)
+
+        # Log the intervention event
+        _ev_log = getattr(self, "_mem_event_logger", None)
+        if _ev_log is not None:
+            _ev_log.log_intervention(
+                memory_id=memory_id,
+                operator=operator,
+                source=source,
+            )
+
     def update_values(self, successes: List[float], retrieved_ids_list: List[List[str]], rewards: Optional[List[float]] = None) -> Dict[str, Optional[float]]:
         # Keep MemRL's original Q update path.
         q_updates = super().update_values(successes=successes, retrieved_ids_list=retrieved_ids_list, rewards=rewards)
@@ -572,4 +936,221 @@ class BeliefMemoryService(MemoryService):
                 except Exception:
                     # Best-effort: belief metadata must not break the original MemRL path.
                     continue
+
+            # Cross-memory conflict detection
+            try:
+                conflicts = self._detect_cross_memory_conflicts(mem_ids or [], ok)
+                if conflicts:
+                    _ev_log = getattr(self, "_mem_event_logger", None)
+                    if _ev_log is not None:
+                        for mid_a, mid_b in conflicts:
+                            _ev_log.log_update(
+                                memory_id=mid_a,
+                                q_value=float(self.q_cache.get(mid_a, 0.0)),
+                                task_success=ok,
+                                belief_conflict=1.0,
+                                extra={"cross_conflict_with": mid_b},
+                            )
+            except Exception:
+                pass
+
         return q_updates
+
+    # ------------------------------------------------------------------
+    # Successful divergence detection
+    # ------------------------------------------------------------------
+
+    def check_divergence_and_refine(
+        self,
+        task_descriptions: List[str],
+        trajectories: List[str],
+        successes: List[bool],
+        retrieved_ids_list: List[List[str]],
+        divergence_threshold: float = 0.35,
+    ) -> int:
+        """Check for successful divergence and trigger Refine where needed.
+
+        Called by runners after update_values(). If a task succeeded but the
+        actual trajectory is significantly different from the retrieved memory's
+        content, the memory should be generalized via Refine.
+
+        Args:
+            task_descriptions: Task descriptions for context.
+            trajectories: Actual trajectories executed by the agent.
+            successes: Whether each task succeeded.
+            retrieved_ids_list: Memory IDs that were retrieved for each task.
+            divergence_threshold: Maximum belief-key overlap below which
+                trajectory is considered divergent from memory.
+
+        Returns:
+            Number of memories refined due to divergence.
+        """
+        refined_count = 0
+        for i, (td, traj, succ) in enumerate(zip(task_descriptions, trajectories, successes)):
+            if not succ:
+                continue  # Only trigger on success
+            mem_ids = retrieved_ids_list[i] if i < len(retrieved_ids_list) else []
+            if not mem_ids:
+                continue
+
+            # Compare trajectory against each retrieved memory's content
+            new_terms = set(self._tokenize(traj[:1500])) - _STOPWORDS
+            if len(new_terms) < 3:
+                continue
+
+            for mid in mem_ids:
+                if not mid:
+                    continue
+                try:
+                    item = self._read_memory(str(mid))
+                    content = str(getattr(item, "memory", "") or "")
+                    if not content:
+                        continue
+                    mem_terms = set(self._tokenize(content[:1500])) - _STOPWORDS
+                    if not mem_terms:
+                        continue
+
+                    # Jaccard overlap as divergence measure
+                    overlap = len(new_terms & mem_terms) / max(len(new_terms | mem_terms), 1)
+                    if overlap < divergence_threshold:
+                        # Trajectory diverged significantly from memory — refine
+                        self.refine_memory(
+                            str(mid),
+                            trigger="successful_divergence",
+                            reset_posterior=False,
+                            new_trajectory=traj,
+                            task_description=td,
+                            success=True,
+                        )
+                        refined_count += 1
+                except Exception:
+                    continue
+        return refined_count
+
+    # ------------------------------------------------------------------
+    # State-first interface: compile retrieved memories into structured state
+    # ------------------------------------------------------------------
+
+    def compile_state(
+        self,
+        task_description: str,
+        k: int = 5,
+        threshold: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Compile current belief state relevant to the given task.
+
+        Instead of returning raw memory text, this method retrieves memories
+        and compiles them into a structured state dict grouped by confidence.
+
+        Returns:
+            {
+                "active_beliefs": [...],    # high-confidence strategies
+                "uncertain_beliefs": [...], # low-confidence / high-conflict
+                "budget_info": {...},       # utilization stats
+                "raw_retrieval": {...},     # original retrieve_query result
+            }
+        """
+        raw = self.retrieve_query(task_description, k=k, threshold=threshold)
+        candidates = raw.get("selected", []) or raw.get("candidates", [])
+
+        active = []
+        uncertain = []
+        variance_threshold = 0.25  # Beta variance threshold for uncertainty
+
+        for c in candidates:
+            meta = _meta_to_dict(c.get("metadata", {}))
+            memory_id = c.get("memory_id", "")
+            content = c.get("content") or meta.get("full_content", "")
+
+            alpha = float(meta.get("belief_alpha", 1.0))
+            beta_val = float(meta.get("belief_beta", 1.0))
+            posterior_mean = alpha / (alpha + beta_val)
+            posterior_var = (alpha * beta_val) / ((alpha + beta_val) ** 2 * (alpha + beta_val + 1))
+            reuse = int(float(meta.get("belief_reuse", meta.get("n_reuse", 0))))
+            conflict = float(meta.get("belief_conflict", meta.get("n_conflict", 0)))
+            conflict_rate = conflict / (reuse + 1) if reuse >= 0 else 0.0
+            q_value = float(meta.get("q_value", 0.0))
+            belief_key = meta.get("belief_key", meta.get("belief_text", ""))
+            success_flag = meta.get("success", None)
+
+            entry = {
+                "memory_id": memory_id,
+                "belief_key": str(belief_key)[:100],
+                "content_summary": str(content)[:500] if content else "",
+                "posterior_mean": round(posterior_mean, 3),
+                "posterior_var": round(posterior_var, 4),
+                "conflict_rate": round(conflict_rate, 3),
+                "reuse_count": reuse,
+                "q_value": round(q_value, 3),
+                "success": success_flag,
+            }
+
+            if posterior_var > variance_threshold or conflict_rate > 0.3:
+                uncertain.append(entry)
+            else:
+                active.append(entry)
+
+        # Budget info
+        bm = getattr(self, "_budget_manager", None)
+        mem_count = self.get_memory_count() if hasattr(self, "get_memory_count") else 0
+        budget_info = {
+            "total_memories": mem_count,
+            "budget": bm.budget if bm else 0,
+            "utilization": round(mem_count / bm.budget, 2) if bm and bm.budget > 0 else 0.0,
+        }
+
+        return {
+            "active_beliefs": active,
+            "uncertain_beliefs": uncertain,
+            "budget_info": budget_info,
+            "raw_retrieval": raw,
+        }
+
+    def format_state_prompt(self, state: Dict[str, Any]) -> str:
+        """Convert compiled state into a concise text block for the agent prompt.
+
+        Args:
+            state: Output of compile_state().
+
+        Returns:
+            Formatted string for injection into agent context.
+        """
+        parts = []
+        active = state.get("active_beliefs", [])
+        uncertain = state.get("uncertain_beliefs", [])
+        budget = state.get("budget_info", {})
+
+        if active:
+            parts.append("[OPERATING STATE — Confident strategies]")
+            for i, entry in enumerate(active, 1):
+                success_str = f"success rate {entry['posterior_mean']:.0%}" if entry["reuse_count"] > 0 else "untested"
+                line = (
+                    f"  {i}. {entry['belief_key']}: "
+                    f"{success_str} ({entry['reuse_count']} uses, Q={entry['q_value']:.2f})"
+                )
+                if entry["content_summary"]:
+                    # Extract first line of content as strategy hint
+                    first_line = entry["content_summary"].split("\n")[0][:150]
+                    line += f"\n     Strategy: {first_line}"
+                parts.append(line)
+
+        if uncertain:
+            parts.append("\n[UNCERTAIN — Use with caution]")
+            for i, entry in enumerate(uncertain, 1):
+                reason = "high conflict" if entry["conflict_rate"] > 0.3 else "low confidence"
+                parts.append(
+                    f"  {i}. {entry['belief_key']}: "
+                    f"{entry['posterior_mean']:.0%} success, {reason} "
+                    f"({entry['reuse_count']} uses)"
+                )
+
+        if budget.get("budget", 0) > 0:
+            parts.append(
+                f"\n[BUDGET] {budget['total_memories']}/{budget['budget']} memories "
+                f"({budget['utilization']:.0%} utilization)"
+            )
+
+        if not active and not uncertain:
+            parts.append("[NO RELEVANT MEMORIES]")
+
+        return "\n".join(parts)

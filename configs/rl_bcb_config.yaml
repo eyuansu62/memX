@@ -98,6 +98,16 @@ experiment:
   enable_logging: true
   log_level: "INFO"
 
+# Belief-augmented memory config (BeliefMemoryService).
+# Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
+# belief:
+#   weight_legacy: 0.45
+#   weight_belief_similarity: 0.25
+#   weight_belief_posterior: 0.20
+#   weight_conflict_penalty: 0.10
+#   auto_refine_conflict_threshold: 0.5
+#   auto_refine_min_reuse: 3
+
 rl_config:
   epsilon: 0.1
   tau: 0.35

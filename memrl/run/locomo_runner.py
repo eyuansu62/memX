@@ -179,7 +179,9 @@ class LoCoMoRunner(BaseRunner):
         ckpt_resume_epoch: Optional[int] = None,
         baseline_mode: Optional[str] = None,
         baseline_k: int = 10,
+        state_first: bool = False,
     ) -> None:
+        self.state_first = bool(state_first)
         self.name = name
         self.llm = llm
         self.sel = selection
@@ -401,6 +403,21 @@ class LoCoMoRunner(BaseRunner):
                     ret_result, retrieved_topk_queries = ret, None
                 selected = ret_result.get("selected", []) if ret_result else []
                 memory_ctx, retrieved_ids = self._build_memory_context(selected)
+                # State-first: replace raw memory context with compiled state view
+                if self.state_first and hasattr(self.memory_service, "compile_state"):
+                    try:
+                        rl_cfg = getattr(self.memory_service, "rl_config", None)
+                        tau = float(getattr(rl_cfg, "sim_threshold", getattr(rl_cfg, "tau", 0.0)))
+                        state = self.memory_service.compile_state(question, k=self.retrieve_k, threshold=tau)
+                        state_prompt = self.memory_service.format_state_prompt(state)
+                        if state_prompt and state_prompt.strip():
+                            memory_ctx = (
+                                "Below is your current operating state — a pre-processed summary of "
+                                "relevant memories, ranked by reliability and relevance. Use this as "
+                                "your primary decision context:\n\n" + state_prompt
+                            )
+                    except Exception as e:
+                        logger.warning("State compilation failed, falling back to raw memories: %s", e)
             except Exception as e:
                 logger.warning("Memory retrieval failed for QA: %s", e)
 
@@ -526,6 +543,16 @@ class LoCoMoRunner(BaseRunner):
                         retrieved_memory_ids_list=retrieved_ids_list,
                         metadatas=metadatas,
                     )
+                    # Check for successful divergence and auto-refine
+                    if hasattr(self.memory_service, "check_divergence_and_refine"):
+                        n_refined = self.memory_service.check_divergence_and_refine(
+                            task_descriptions=task_descriptions,
+                            trajectories=trajectories,
+                            successes=successes,
+                            retrieved_ids_list=retrieved_ids_list,
+                        )
+                        if n_refined > 0:
+                            logger.info(f"Divergence-triggered refine: {n_refined} memories rewritten")
                 except Exception as e:
                     logger.warning("[train sec %d] memory update failed: %s", sec_idx, e)
 
@@ -662,6 +689,12 @@ class LoCoMoRunner(BaseRunner):
         # Section loop
         for sec_idx in range(1, self.num_sections + 1):
             logger.info("=== Section %d/%d ===", sec_idx, self.num_sections)
+
+            # Epoch lifecycle: expire stale memories and enforce budget
+            if hasattr(self.memsvc, "begin_epoch"):
+                lifecycle = self.memsvc.begin_epoch(sec_idx)
+                if lifecycle.get("expired", 0) > 0 or lifecycle.get("evicted", 0) > 0:
+                    logger.info(f"Epoch lifecycle: {lifecycle}")
 
             if train_qas:
                 res = self._train_one_section(train_qas, sec_idx)

@@ -145,6 +145,16 @@ experiment:  # Experiment / runner settings.
   enable_logging: true         # Enable detailed logging.
   log_level: "INFO"            # Log level (INFO/DEBUG/WARNING/ERROR).
 
+# Belief-augmented memory config (BeliefMemoryService).
+# Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
+# belief:
+#   weight_legacy: 0.45
+#   weight_belief_similarity: 0.25
+#   weight_belief_posterior: 0.20
+#   weight_conflict_penalty: 0.10
+#   auto_refine_conflict_threshold: 0.5
+#   auto_refine_min_reuse: 3
+
 rl_config:  # RL/value-driven knobs used by MemoryService and runners.
   epsilon: 0.01                 # Epsilon-greedy exploration probability for value-aware selection.
   tau: 0.35                    # Unknown-detection threshold on similarity (not the same as sim_threshold).

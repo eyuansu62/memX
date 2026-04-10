@@ -1,0 +1,55 @@
+%---------------------------------------------------------------------
+\subsection{State-Transition Operators}
+\label{sec:state-transitions}
+
+We define seven primitive operators that govern how the memory state $z_t$ evolves. Table~\ref{tab:operators} summarizes each operator's trigger, effect, and budget interaction.
+
+\begin{table}[t]
+\centering
+\caption{State-transition operators. $|z|$: memory count; $\Delta|z|$: change after the operation.}
+\label{tab:operators}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l p{3.2cm} p{4.8cm} c@{}}
+\toprule
+\textbf{Operator} & \textbf{Trigger} & \textbf{What changes} & $\boldsymbol{\Delta|z|}$ \\
+\midrule
+\textsc{Create}
+  & New trajectory
+  & New entry added
+  & $+1$ \\[3pt]
+\textsc{Refine}
+  & Belief instability, budget pressure, or successful divergence
+  & Content \& embedding rewritten; ID, $Q_i$, $(\alpha_i,\beta_i)$ kept
+  & $0$ \\[3pt]
+\textsc{Override}
+  & Task outcome observed
+  & $Q_i$, $(\alpha_i,\beta_i)$, $n_i^{\mathrm{reuse}}$, $n_i^{\mathrm{conflict}}$ updated; content kept
+  & $0$ \\[3pt]
+\textsc{Merge}
+  & Sim $\geq \theta_{\mathrm{nov}}$ with existing memory
+  & Reward attributed to existing entry; no new entry created
+  & $0$ \\[3pt]
+\textsc{Expire}
+  & TTL elapsed or validity window closed
+  & Filtered from retrieval; hard-deleted under budget pressure
+  & $0/-1$ \\[3pt]
+\textsc{Delete}
+  & Explicit request or budget eviction
+  & Entry permanently removed
+  & $-1$ \\[3pt]
+\textsc{Redact}
+  & Sensitive content detected
+  & Matched spans masked; metadata \& $Q_i$ kept
+  & $0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The first four operators (\textsc{Create}, \textsc{Refine}, \textsc{Override}, and \textsc{Merge}) form the core loop and are exercised on every task cycle. They are distinguished by what they modify. \textsc{Create} adds a new entry ($\Delta|z|{=}+1$). \textsc{Override} updates value statistics ($Q_i$, $\alpha_i$, $\beta_i$) without touching content. \textsc{Refine} rewrites content while preserving identity and accumulated statistics. \textsc{Merge} avoids duplication by attributing reward to an existing near-identical memory. A key design choice is that under budget pressure ($|z|/B > \rho$), the system prefers \textsc{Refine} over \textsc{Create} when a semantically similar memory already exists, making memory consolidation budget-aware.
+
+\paragraph{\textsc{Refine}.}
+\textsc{Refine} is triggered when a memory's content is stale or imprecise but its accumulated statistics remain valuable. Three conditions activate it: (1)~belief instability, when the conflict rate $r_i^{\mathrm{conflict}}$ exceeds $\delta_r$, indicating the memory's strategy works inconsistently; (2)~budget-driven consolidation, when a new trajectory is similar to an existing memory and budget utilization is high; (3)~successful divergence, when the task succeeded via a strategy substantially different from what the memory recommended. The refinement is performed by an LLM call that receives the original content, belief text, and recent outcomes, and produces a revised version. The belief text and embedding are recomputed; $Q_i$ and $(\alpha_i, \beta_i)$ are preserved.
+
+\paragraph{State-reduction operators.}
+\textsc{Expire}, \textsc{Delete}, and \textsc{Redact} reduce or sanitize the active state. \textsc{Expire} uses a per-memory TTL or validity window; expired memories are filtered from retrieval and prioritized for hard deletion under budget pressure. \textsc{Delete} permanently removes entries, either explicitly or as the eviction mechanism of the budget manager (\S\ref{sec:budget}). \textsc{Redact} masks sensitive spans in memory content while preserving the entry's structural role, enabling fine-grained information removal without full deletion.

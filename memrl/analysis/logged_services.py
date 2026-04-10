@@ -246,3 +246,85 @@ class LoggedBeliefMemoryService(LoggedMemoryService, BeliefMemoryService):
     # add_memories is inherited from LoggedMemoryService (calls BeliefMemoryService.add_memories
     # via MRO since LoggedMemoryService.add_memories calls super() which resolves to
     # BeliefMemoryService.add_memories in this MRO chain).
+
+    # -----------------------------------------------------------------------
+    # Belief-enriched write logging: override log_write to include belief stats
+    # -----------------------------------------------------------------------
+    def add_memories(
+        self,
+        task_descriptions: List[str],
+        trajectories: List[str],
+        successes: List[bool],
+        retrieved_memory_queries=None,
+        retrieved_memory_ids_list=None,
+        metadatas=None,
+    ) -> Any:
+        # Call BeliefMemoryService.add_memories (which annotates belief metadata)
+        results = BeliefMemoryService.add_memories(
+            self,
+            task_descriptions=task_descriptions,
+            trajectories=trajectories,
+            successes=successes,
+            retrieved_memory_queries=retrieved_memory_queries,
+            retrieved_memory_ids_list=retrieved_memory_ids_list,
+            metadatas=metadatas,
+        )
+        log = getattr(self, "_mem_event_logger", None)
+        if log is None:
+            return results
+
+        pending = getattr(self, "_pending_retrieves", {})
+
+        # Normalize results
+        if isinstance(results, dict):
+            pairs = list(results.items())
+        elif isinstance(results, (list, tuple)):
+            pairs = [(str(r[0]), r[1] if isinstance(r, (list, tuple)) else r) for r in results]
+        else:
+            pairs = [(td, None) for td in task_descriptions]
+
+        for i, (td, mem_id) in enumerate(pairs):
+            traj = trajectories[i] if i < len(trajectories) else ""
+            succ = bool(successes[i]) if i < len(successes) else None
+            traj_lower = str(traj or "").lower()
+
+            # Finalize pending retrieve events
+            for entry in pending.pop(td, []):
+                snippet = entry["memory_text"][:50].lower().strip()
+                used = bool(snippet and snippet in traj_lower)
+                log.log_retrieve(
+                    memory_id=entry["memory_id"],
+                    memory_text=entry["memory_text"],
+                    retrieval_rank=entry["retrieval_rank"],
+                    q_value=entry["q_value"],
+                    task_success=succ,
+                    retrieval_used_in_response=used,
+                    belief_alpha=entry["belief_alpha"],
+                    belief_beta=entry["belief_beta"],
+                    belief_score=entry["belief_score"],
+                    belief_reuse=entry["belief_reuse"],
+                    belief_conflict=entry["belief_conflict"],
+                )
+
+            if not mem_id:
+                continue
+
+            # Read belief metadata written by BeliefMemoryService.add_memories
+            try:
+                item = self._read_memory(str(mem_id))
+                md = _meta_to_dict(getattr(item, "metadata", None))
+            except Exception:
+                md = {}
+
+            log.log_write(
+                memory_id=str(mem_id),
+                memory_text=str(td)[:200],
+                task_success=succ,
+                belief_alpha=float(md.get("belief_alpha", 1.0)),
+                belief_beta=float(md.get("belief_beta", 1.0)),
+                belief_score=float(md.get("belief_score", 0.5)),
+                belief_reuse=float(md.get("belief_reuse", 0.0)),
+                belief_conflict=float(md.get("belief_conflict", 0.0)),
+            )
+
+        return results

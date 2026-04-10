@@ -1,0 +1,202 @@
+\section{Method}
+\label{sec:method}
+
+We propose a memory system that maintains a compact, budget-constrained state from which an agent can directly act. The core loop has three phases: \emph{update} the memory substrate with each completed task (\S\ref{sec:construct}), \emph{compile} an executable state view for a new task (\S\ref{sec:retrieve}), and \emph{maintain} the substrate by updating belief and utility statistics, rewriting stale content, and enforcing a budget (\S\ref{sec:maintain}). We begin by formalizing the objective and representation (\S\ref{sec:formulation}).
+
+%=====================================================================
+\subsection{Problem Formulation and Representation}
+\label{sec:formulation}
+
+An agent interacts with a stream of tasks. At step $t$ the agent has observed a history $x_{1:t}$ of task descriptions, trajectories, and outcomes. It maintains a memory substrate
+\begin{equation}
+\label{eq:state}
+  z_t = f_\theta(x_{1:t};\, B),
+\end{equation}
+where $B$ is a fixed budget (maximum number of entries) and $f_\theta$ is the state-update function realized by the operator pipeline below. For each new task $q_t$, the system compiles an executable state view $\hat{s}_{t-1}(q_t) = \mathrm{compile}(z_{t-1}, q_t)$ from the current substrate (\S\ref{sec:retrieve}), and the agent acts via $a_t \sim \pi(\cdot \mid q_t,\, \hat{s}_{t-1}(q_t))$. The objective is:
+\begin{equation}
+\label{eq:objective}
+  \max_\theta \;\mathbb{E}\!\Bigl[\sum_{t=1}^{T} U\bigl(a_t,\; y_t\bigr)\Bigr],
+  \quad \text{s.t.} \quad |z_t| \leq B \;\;\forall t,
+\end{equation}
+where $U$ is a task-specific utility (e.g., success rate) and $y_t$ is the task outcome.
+
+\paragraph{Representation: substrate and state view.}
+We distinguish two levels of abstraction:
+\begin{itemize}
+  \item The \emph{memory substrate} $z_t$ is the persistently maintained object. It is a pool of memory entries that the system's operators act upon: \textsc{Create} adds entries, \textsc{Override} updates their statistics, \textsc{Refine} rewrites their content, and \textsc{Delete}/\textsc{Expire} remove them. All maintenance---belief updates, conflict detection, budget enforcement---occurs at this level.
+  \item The \emph{executable state view} $\hat{s}_t(q) = \mathrm{compile}(z_t, q)$ is a task-conditioned projection of the substrate. Given a task query $q$, it selects the most relevant entries from $z_t$, filters out expired or low-confidence material, and formats the result as structured context for the agent. The agent's policy consumes $\hat{s}_t(q)$, not $z_t$ directly.
+\end{itemize}
+This two-level design is the core of what we mean by \emph{state-first}: the agent reads a pre-processed, maintenance-aware state view rather than raw history or unscored candidates. The reasoning burden of deciding which information is current, reliable, and relevant is handled by the maintenance and readout phases, not by the agent at decision time.
+
+The substrate $z_t$ is instantiated as a set of episodic memory entries. Each entry $m_i \in z_t$ has three components:
+\begin{equation}
+\label{eq:memory-entry}
+  m_i = (c_i,\; Q_i,\; b_i),
+\end{equation}
+where $c_i$ is textual content (a proceduralized strategy, script, or trajectory summary), $Q_i$ is a scalar utility estimate reflecting the entry's value for future tasks, and $b_i$ is a belief state tracking the entry's reliability. We separate these two roles explicitly: $Q_i$ answers \emph{how useful is this entry for decision-making}, while $b_i$ answers \emph{how reliable is this entry given observed outcomes}. Both inform retrieval ranking and budget decisions, but through distinct mechanisms described below.
+
+In addition, each entry carries auxiliary lifecycle metadata---creation time, last retrieval timestamp, and a status flag (\texttt{active}/\texttt{expired}/\texttt{redacted})---used by maintenance and budget enforcement but omitted from Eq.~\ref{eq:memory-entry} for clarity.
+
+This representation is a pragmatic choice. The entries in $z_t$ are episodic in nature---they originate from task trajectories and encode strategies or experiences. We do not claim that $z_t$ is a proposition-level world-state store with typed slots and validity windows; rather, the contribution is that the \emph{maintenance discipline} applied to $z_t$ (active update, expiry, conflict-aware rewriting, hard budget) and the \emph{interface contract} (agent reads $\hat{s}_t(q)$, not raw history) together realize the state-first principle on an episodic substrate. A stronger instantiation with structured state cells is a natural direction for future work (\S\ref{sec:discussion}).
+
+\paragraph{Learning signal.}
+The system learns entirely through environmental feedback: task outcomes provide rewards that update Q-values via temporal-difference learning (\S\ref{sec:maintain}), and the same outcomes drive Bayesian belief updates that track each entry's reliability. No supervised labels for state construction or operator selection are required; instead, the belief statistics accumulated over interactions implicitly learn \emph{which} entries are worth retaining (via the retention score in Eq.~\ref{eq:retention}) and \emph{when} content should be rewritten (via the refinement triggers in \S\ref{sec:maintain}). This makes the learning signal fully online and task-driven, though operator selection itself remains rule-based (\S\ref{sec:discussion}).
+
+
+%=====================================================================
+\subsection{Substrate Update}
+\label{sec:construct}
+
+After the agent completes a task with description $d$ and trajectory $\tau$, the system performs a state transition on $z_t$ via one of two paths: creating a new entry (\textsc{Create}) or refining an existing one (\textsc{Refine}).
+
+\paragraph{Content generation.}
+The trajectory is processed into textual content $c_i$ via one of three strategies: raw trajectory recording, LLM-generated script extraction, or proceduralization (a combination of both). The strategy is configured per benchmark and does not change across epochs.
+
+\paragraph{Belief annotation.}
+Each entry is annotated with a belief state:
+\begin{equation}
+\label{eq:belief-state}
+  b_i = (\, k_i,\; \alpha_i,\; \beta_i,\; n_i^{\mathrm{reuse}},\; n_i^{\mathrm{conflict}} \,),
+\end{equation}
+where $k_i$ is a discrete belief key, $(\alpha_i, \beta_i)$ are Beta posterior parameters (initialized to prior counts reflecting the initial task outcome), $n_i^{\mathrm{reuse}}$ counts how often the entry has been retrieved and used, and $n_i^{\mathrm{conflict}}$ counts consecutive outcome reversals. The belief key $k_i$ is extracted from the task description by selecting the top-$K_g$ non-stopword tokens as goal terms and up to $K_c$ constraint fragments from sentences containing markers such as \texttt{must}, \texttt{avoid}, or \texttt{error}. These are concatenated into a normalized string that serves as a coarse semantic fingerprint. Each entry is optionally dual-indexed under both its content and belief key to improve recall for lexically different but semantically related queries.
+
+\paragraph{Write routing.}
+When budget utilization $|z_t|/B$ exceeds a routing threshold $\rho$ and a new trajectory has high similarity to an existing entry, the system routes to \textsc{Refine} rather than \textsc{Create}, consolidating rather than accumulating. This ensures that the substrate grows only when genuinely new experience is encountered.
+
+
+%=====================================================================
+\subsection{Executable State Compilation}
+\label{sec:retrieve}
+
+Given a new task with query $q$, the system produces an executable state view $\hat{s}_t(q)$ that serves as the agent's decision context.
+
+\paragraph{Candidate generation.}
+The substrate is queried via hybrid retrieval (keyword matching followed by Q-value filtering) to produce a candidate set $\mathcal{C} \subseteq z_t$. Expired entries (those whose status is \texttt{expired}) are filtered out at this stage.
+
+\paragraph{Belief-augmented rescoring.}
+Each candidate $m_i \in \mathcal{C}$ is rescored using both utility and belief signals:
+\begin{equation}
+\label{eq:belief-score}
+  s(m_i, q) =
+    w_{\ell} \cdot s_i^{\mathrm{legacy}}
+  + w_{\mathrm{bk}} \cdot \mathrm{overlap}(k_q,\, k_i)
+  + w_{\mu} \cdot (2\bar{\mu}_i - 1)
+  - w_{\mathrm{cf}} \cdot r_i^{\mathrm{conflict}},
+\end{equation}
+where:
+\begin{itemize}
+  \item $s_i^{\mathrm{legacy}}$ is the base composite score: a weighted combination of z-normalized cosine similarity and z-normalized Q-value~\citep{zhang2026memrl}, capturing textual relevance and decision utility jointly;
+  \item $\mathrm{overlap}(k_q, k_i) = |k_q \cap k_i| \,/\, |k_q \cup k_i|$ is the Jaccard similarity between belief keys of the query and the entry, measuring structural goal/constraint alignment;
+  \item $\bar{\mu}_i = \alpha_i / (\alpha_i + \beta_i)$ is the Beta posterior mean (belief confidence), mapped to $[-1, 1]$;
+  \item $r_i^{\mathrm{conflict}} = n_i^{\mathrm{conflict}} / (n_i^{\mathrm{reuse}} + 1)$ is the conflict rate, penalizing entries with unstable outcomes.
+\end{itemize}
+The default weights are $w_\ell {=} 0.50$, $w_{\mathrm{bk}} {=} 0.25$, $w_{\mu} {=} 0.15$, $w_{\mathrm{cf}} {=} 0.10$. To promote diversity, at most one entry per unique belief key is retained in the final top-$k$ selection.
+
+\paragraph{Compiled executable state.}
+Let $\mathcal{T}_k(q)$ denote the final top-$k$ set after belief-aware rescoring and one-per-key deduplication. We compile these entries into a compact executable state view:
+\begin{equation}
+\label{eq:compiled-view}
+  \hat{s}_t(q) = \bigl\{\, \tilde{m}_i \bigr\}_{i \in \mathcal{T}_k(q)}, \qquad
+  \tilde{m}_i = (c_i,\; Q_i,\; \bar{\mu}_i,\; r_i^{\mathrm{conflict}}),
+\end{equation}
+where $\bar{\mu}_i = \alpha_i / (\alpha_i + \beta_i)$ is belief confidence (as in Eq.~\ref{eq:belief-score}). The compiled view is ordered by Eq.~\ref{eq:belief-score}. At the presentation level, entries may be annotated as high-confidence or uncertain based on posterior variance and conflict rate, and budget utilization $|z_t|/B$ may be appended as context; these are formatting choices in the prompt template rather than formal components of $\hat{s}_t$.
+
+The agent's policy is $\pi(a_t \mid x_t,\, \hat{s}_t(q))$: it reads this compiled state view as its primary context. Raw history or unscored entries are not exposed to the policy; the compiled view is the sole interface. Because the maintenance phase (\S\ref{sec:maintain}) ensures that $z_t$ is kept consistent and current before compilation, the agent can treat $\hat{s}_t(q)$ as an executable operating state rather than a set of historical candidates to be reconciled at decision time.
+
+
+%=====================================================================
+\subsection{Belief and Utility Maintenance}
+\label{sec:maintain}
+
+After each task outcome, the system maintains $z_t$ through four mechanisms: utility update, belief update, content refinement, and budget enforcement. Table~\ref{tab:operators} summarizes all operators.
+
+\paragraph{Utility update (\textsc{Override}).}
+The Q-value of each retrieved entry is updated via temporal-difference learning:
+\begin{equation}
+\label{eq:q-update}
+  Q_i \leftarrow (1 - \alpha_{\mathrm{lr}}) \cdot Q_i + \alpha_{\mathrm{lr}} \cdot (r + \gamma \cdot \max_{j} Q_j),
+\end{equation}
+following the Monte Carlo simplification in MemRL~\citep{zhang2026memrl}. $Q_i$ captures \emph{decision utility}: how valuable this entry is for future task performance. It adapts quickly to recent rewards and directly influences both retrieval ranking (via $s_i^{\mathrm{legacy}}$ in Eq.~\ref{eq:belief-score}) and retention priority (Eq.~\ref{eq:retention}).
+
+\paragraph{Belief update.}
+Simultaneously, the belief state is updated:
+\begin{equation}
+\label{eq:belief-update}
+  \alpha_i \leftarrow \alpha_i + \mathbb{1}[\text{success}], \quad
+  \beta_i  \leftarrow \beta_i  + \mathbb{1}[\text{failure}], \quad
+  n_i^{\mathrm{reuse}} \leftarrow n_i^{\mathrm{reuse}} + 1.
+\end{equation}
+The conflict counter increments when the outcome differs from the previous one:
+\begin{equation}
+\label{eq:conflict-update}
+  n_i^{\mathrm{conflict}} \leftarrow n_i^{\mathrm{conflict}} + \mathbb{1}\!\bigl[\text{outcome} \neq \text{last\_outcome}(m_i)\bigr].
+\end{equation}
+The belief state captures \emph{reliability}: $\bar{\mu}_i$ estimates historical success rate, the posterior variance quantifies confidence, and $r_i^{\mathrm{conflict}}$ detects oscillating outcomes. Together, utility and belief form a dual-rate learning mechanism: Q-learning provides fast, reward-sensitive adaptation to the entry's value for action, while the Beta posterior accumulates stable statistics about the entry's trustworthiness. These two signals serve complementary roles in retrieval, refinement triggering, and budget decisions.
+
+\paragraph{Content refinement (\textsc{Refine}).}
+\textsc{Refine} is the primary content-editing operator: it rewrites an entry in place while preserving its identity. Automatic refinement preserves the accumulated utility and belief statistics; externally triggered correction additionally resets the posterior to its prior, since the revised content invalidates the previous outcome record. Three automatic conditions trigger refinement:
+\begin{enumerate}
+  \item \emph{Belief instability}: the conflict rate $r_i^{\mathrm{conflict}}$ exceeds a threshold $\delta_r$ after at least $n_{\min}$ reuses, indicating the strategy works inconsistently. On trigger, the conflict counter is reset and the posterior is soft-reset (counts halved toward the prior) to allow fresh evidence accumulation on the rewritten content.
+  \item \emph{Budget-driven consolidation}: budget utilization exceeds $\rho$ and a new trajectory is similar to an existing entry; the existing entry is refined in place rather than creating a new one.
+  \item \emph{Successful divergence}: the task succeeded but the actual trajectory diverged from the entry's recorded strategy, suggesting the entry should be generalized.
+\end{enumerate}
+Refinement is performed by an LLM call that receives the original content, belief key, and recent outcomes, and produces a revised version. The belief key is recomputed from the new content.
+
+\paragraph{Budget enforcement.}
+The budget $B$ imposes a hard limit on $|z_t|$. When $|z_t| > B$ after a \textsc{Create}, the system selects the lowest-value entries for \textsc{Delete}. Each entry's retention score combines utility and belief:
+\begin{equation}
+\label{eq:retention}
+  r_i^{\mathrm{retain}} = w_1 \cdot Q_i + w_2 \cdot \bar{\mu}_i + w_3 \cdot \mathrm{recency}(m_i),
+\end{equation}
+where $\mathrm{recency}(m_i)$ is a time-decay function of the last retrieval timestamp. Expired entries are deleted first; among non-expired entries, the lowest retention scores are evicted. The retention score reflects both utility (is this entry valuable?) and belief (is this entry reliable?), ensuring that low-value or unreliable entries are pruned before high-confidence, high-utility ones.
+
+\begin{table}[t]
+\centering
+\caption{State-transition operators over the maintained episodic substrate $z_t$. $\Delta|z|$: change in entry count after the operation.}
+\label{tab:operators}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l p{3.0cm} p{5.0cm} c@{}}
+\toprule
+\textbf{Operator} & \textbf{Trigger} & \textbf{Effect on $z_t$} & $\boldsymbol{\Delta|z|}$ \\
+\midrule
+\textsc{Create}
+  & New trajectory
+  & New entry $(c_i, Q_0, b_0)$ added to $z_t$
+  & $+1$ \\[3pt]
+\textsc{Override}
+  & Task outcome observed or external value signal
+  & $Q_i$, $(\alpha_i,\beta_i)$, $n_i^{\mathrm{reuse}}$, $n_i^{\mathrm{conflict}}$ updated; content $c_i$ unchanged in current instantiation
+  & $0$ \\[3pt]
+\textsc{Refine}
+  & Belief instability, budget pressure, or successful divergence
+  & Content $c_i$ rewritten; entry identity and statistics preserved (posterior optionally soft-reset)
+  & $0$ \\[3pt]
+\textsc{Merge}
+  & Sim $\geq \theta_{\mathrm{nov}}$ with existing entry
+  & Reward attributed to existing entry; no new entry created
+  & $0$ \\[3pt]
+\textsc{Expire}
+  & TTL elapsed or policy marks entry inactive
+  & Entry excluded from readout; hard-deleted under budget pressure
+  & $0/-1$ \\[3pt]
+\textsc{Delete}
+  & Budget eviction or explicit request
+  & Entry permanently removed from $z_t$
+  & $-1$ \\[3pt]
+\textsc{Redact}
+  & Sensitive content detected
+  & Matched spans in $c_i$ masked; statistics and $Q_i$ preserved
+  & $0$ \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+
+{\footnotesize These operators modify the maintained episodic substrate from which executable state views are compiled; they should not be read as updates to a fully typed symbolic knowledge base.}
+\end{table}
+
+\paragraph{Intervention-ready state.}
+Because state transitions are mediated by explicit operators, any operator can be triggered externally---by a human supervisor, a policy change, or new evidence---with immediate effect. \textsc{Override} accepts an external value signal to directly adjust $Q_i$ and the posterior. \textsc{Refine} accepts a correction that rewrites content $c_i$ with a full posterior reset (since the rewritten content invalidates accumulated statistics). \textsc{Delete} and \textsc{Redact} accept targeted removal or masking requests. In each case, the next compiled state $\hat{s}_{t}(q)$ reflects the updated substrate without requiring additional task cycles. This property makes the system suitable for settings where corrections must override learned behavior on demand.
+
+\paragraph{Scope and limitations.}
+The current operators act on individual entries and do not explicitly track inter-entry dependencies. However, the system provides a form of \emph{soft propagation}: when an upstream entry is deleted or rewritten, downstream entries that depended on it may produce worse outcomes in subsequent tasks, driving up their conflict rate, lowering their Q-values, and potentially triggering \textsc{Refine} or budget eviction. The correction is not instantaneous but occurs over the natural course of interaction. More broadly, the maintained substrate remains episodic rather than fully typed or symbolic. Extending the framework with provenance tracking, dependency-aware cascading updates, and structured state cells is a natural direction for future work.

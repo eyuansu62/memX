@@ -129,7 +129,9 @@ class LLBRunner(BaseRunner):
         kg_offline_fallback: bool = False,
         limit: Optional[int] = None,
         valid_file: Optional[str] = None,
+        state_first: bool = False,
     ):
+        self.state_first = bool(state_first)
         self.root = root
         self.memory_service = memory_service
         self.llm_provider = llm_provider
@@ -368,15 +370,34 @@ class LLBRunner(BaseRunner):
             language_model=self.adapter, system_prompt=full_prompt
         )
 
-    def _build_llb_full_prompt(self, *, memory_context: Optional[str]) -> str:
+    def _build_llb_full_prompt(
+        self, *, memory_context: Optional[str], task_description: Optional[str] = None,
+    ) -> str:
         """Build the exact system prompt used by LanguageModelAgent."""
+        # State-first: compile state view if available
+        ctx = memory_context
+        if self.state_first and ctx and hasattr(self.memory_service, "compile_state"):
+            try:
+                rl_cfg = getattr(self.memory_service, "rl_config", None)
+                tau = float(getattr(rl_cfg, "sim_threshold", getattr(rl_cfg, "tau", 0.0)))
+                query = task_description or ""
+                state = self.memory_service.compile_state(query, k=self.retrieve_k, threshold=tau)
+                state_prompt = self.memory_service.format_state_prompt(state)
+                if state_prompt and state_prompt.strip():
+                    ctx = (
+                        "Below is your current operating state — a pre-processed summary of "
+                        "relevant memories, ranked by reliability and relevance. Use this as "
+                        "your primary decision context:\n\n" + state_prompt
+                    )
+            except Exception:
+                pass  # fall back to raw memory_context
         # Align prompt assembly ordering with memory_rl/dev/feat-mdp-llb:
         # system prompt -> (optional) memory context -> strict output constraints at the very end.
-        if memory_context:
+        if ctx:
             return build_llb_prompt_with_memory(
                 task=self.task,
                 base_prompt=self._base_system_prompt,
-                memory_context=memory_context,
+                memory_context=ctx,
             )
         return self.system_prompt
 
@@ -1130,6 +1151,12 @@ class LLBRunner(BaseRunner):
             )
             logger.info(f"Total samples in section {section_num}: {len(section_keys)}")
 
+            # Epoch lifecycle: expire stale memories and enforce budget
+            if hasattr(self.memory_service, "begin_epoch"):
+                lifecycle = self.memory_service.begin_epoch(section_num)
+                if lifecycle.get("expired", 0) > 0 or lifecycle.get("evicted", 0) > 0:
+                    logger.info(f"Epoch lifecycle: {lifecycle}")
+
             # Split section into mini-batches
             num_mini_batches = int(np.ceil(len(section_keys) / self.batch_size))
             section_mini_batches = [
@@ -1251,6 +1278,16 @@ class LLBRunner(BaseRunner):
                     retrieved_memory_ids_list=retrieved_ids_list,
                     metadatas=metadatas_update,
                 )
+                # Check for successful divergence and auto-refine
+                if hasattr(self.memory_service, "check_divergence_and_refine"):
+                    n_refined = self.memory_service.check_divergence_and_refine(
+                        task_descriptions=task_descriptions,
+                        trajectories=trajectories,
+                        successes=successes,
+                        retrieved_ids_list=retrieved_ids_list,
+                    )
+                    if n_refined > 0:
+                        logger.info(f"Divergence-triggered refine: {n_refined} memories rewritten")
 
                 # Track memory references for chain MDP
                 for i, (task_desc, mem_id) in enumerate(result_vis):

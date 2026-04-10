@@ -253,7 +253,11 @@ def main():
             # LLB-only: optionally deduplicate final top-k retrieved memories by task_id.
             dedup_by_task_id=bool(getattr(config.experiment, "llb_dedup_by_task_id", False)),
             vector_dimension=config.embedding.vector_dimension,
-            belief_config=BeliefConfig(),
+            memory_budget=getattr(config.memory, "memory_budget", 0),
+            budget_policy=getattr(config.memory, "budget_policy", "q_weighted"),
+            budget_check_interval=getattr(config.memory, "budget_check_interval", 1),
+            budget_utilization_threshold=getattr(config.memory, "budget_utilization_threshold", 0.8),
+            belief_config=config.belief.to_dataclass() if hasattr(config, "belief") else BeliefConfig(),
         )
 
         # Load from checkpoint if configured
@@ -314,6 +318,7 @@ def main():
             algorithm=config.experiment.algorithm,
             val_before_train=config.experiment.val_before_train,
             valid_file=config.experiment.valid_file,  # Get from config
+            state_first=getattr(config.experiment, "state_first", False),
         )
         # --- RUN THE EXPERIMENT ---
         runner.run()

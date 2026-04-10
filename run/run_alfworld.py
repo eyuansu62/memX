@@ -165,11 +165,16 @@ def main():
             sim_norm_mean=getattr(cfg.memory, "sim_norm_mean", None),
             sim_norm_std=getattr(cfg.memory, "sim_norm_std", None),
             vector_dimension=cfg.embedding.vector_dimension,
+            memory_budget=getattr(cfg.memory, "memory_budget", 0),
+            budget_policy=getattr(cfg.memory, "budget_policy", "q_weighted"),
+            budget_check_interval=getattr(cfg.memory, "budget_check_interval", 1),
+            budget_utilization_threshold=getattr(cfg.memory, "budget_utilization_threshold", 0.8),
         )
         use_belief = getattr(args, "memory_service", "belief") != "original"
         if use_belief:
             SvcClass = LoggedBeliefMemoryService if args.log_path else BeliefMemoryService
-            memory_service = SvcClass(**common_svc_kwargs, belief_config=BeliefConfig())
+            belief_cfg = cfg.belief.to_dataclass() if hasattr(cfg, "belief") else BeliefConfig()
+            memory_service = SvcClass(**common_svc_kwargs, belief_config=belief_cfg)
         else:
             SvcClass = LoggedMemoryService if args.log_path else MemoryService
             memory_service = SvcClass(**common_svc_kwargs)
@@ -239,6 +244,7 @@ def main():
             baseline_k=getattr(cfg.experiment, "baseline_k", 10),
             llm_judge=llm_judge,
             llm_judge_alpha=getattr(cfg.experiment, "llm_judge_alpha", 0.3),
+            state_first=getattr(cfg.experiment, "state_first", False),
         )
         runner.run()
 

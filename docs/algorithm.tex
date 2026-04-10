@@ -1,0 +1,58 @@
+\begin{algorithm}[t]
+\caption{Budgeted Adaptive State Tracking}
+\label{alg:main}
+\begin{algorithmic}[1]
+\Require Task stream $\{q_t\}_{t=1}^T$, budget $B$, routing threshold $\rho$
+\State Initialize substrate $z_0 \leftarrow \emptyset$
+
+\For{$t = 1, \ldots, T$}
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{\% Phase 1: Executable State Compilation (\S\ref{sec:retrieve})}}
+  \State $\mathcal{C} \leftarrow \textsc{CandidateGen}(z_{t-1}, q_t)$ \Comment{hybrid retrieval, filter expired}
+  \For{$m_i \in \mathcal{C}$}
+    \State $s_i \leftarrow w_\ell \cdot s_i^{\mathrm{leg}} + w_{\mathrm{bk}} \cdot \mathrm{overlap}(k_q, k_i) + w_\mu \cdot (2\bar{\mu}_i{-}1) - w_{\mathrm{cf}} \cdot r_i^{\mathrm{cf}}$
+  \EndFor
+  \State $\mathcal{T}_k \leftarrow \textsc{TopK-Dedup}(\mathcal{C}, k)$ \Comment{one per belief key}
+  \State $\hat{s}_{t-1}(q_t) \leftarrow \bigl\{(c_i, Q_i, \bar{\mu}_i, r_i^{\mathrm{cf}})\bigr\}_{i \in \mathcal{T}_k}$
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{\% Phase 2: Agent Execution}}
+  \State $a_t \sim \pi(\cdot \mid q_t,\; \hat{s}_{t-1}(q_t))$
+  \State Observe outcome $y_t$, reward $r_t$, trajectory $\tau_t$
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{\% Phase 3: Belief and Utility Maintenance (\S\ref{sec:maintain})}}
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{--- Utility update (Override) ---}}
+  \For{$m_i \in \mathcal{T}_k$}
+    \State $Q_i \leftarrow (1{-}\alpha_{\mathrm{lr}}) Q_i + \alpha_{\mathrm{lr}}(r_t + \gamma \max_j Q_j)$ \Comment{decision utility}
+  \EndFor
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{--- Belief update ---}}
+  \For{$m_i \in \mathcal{T}_k$}
+    \State $\alpha_i \mathrel{+}= \mathbb{1}[\text{success}]$;\; $\beta_i \mathrel{+}= \mathbb{1}[\text{failure}]$;\; $n_i^{\mathrm{reuse}} \mathrel{+}= 1$ \Comment{reliability}
+    \State $n_i^{\mathrm{cf}} \mathrel{+}= \mathbb{1}[\text{outcome} \neq \text{last\_outcome}(m_i)]$
+  \EndFor
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{--- Substrate update (\S\ref{sec:construct}) ---}}
+  \If{$|z_t|/B > \rho$ \textbf{and} $\exists\, m_j \in z_t: \mathrm{sim}(\tau_t, m_j) \geq \theta_{\mathrm{nov}}$}
+    \State $\textsc{Refine}(m_j, \tau_t)$ \Comment{consolidate; content rewritten, ID kept}
+  \Else
+    \State $m_{\mathrm{new}} \leftarrow \textsc{Create}(q_t, \tau_t, y_t)$ \Comment{new entry with belief annotation}
+    \State $z_t \leftarrow z_t \cup \{m_{\mathrm{new}}\}$
+  \EndIf
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{--- Auto-refine on belief instability ---}}
+  \For{$m_i \in \mathcal{T}_k$}
+    \If{$r_i^{\mathrm{cf}} > \delta_r$ \textbf{and} $n_i^{\mathrm{reuse}} \geq n_{\min}$}
+      \State $\textsc{Refine}(m_i)$;\; reset $n_i^{\mathrm{cf}} \leftarrow 0$;\; soft-reset $(\alpha_i, \beta_i)$
+    \EndIf
+  \EndFor
+
+  \Statex \hspace{\algorithmicindent}\textcolor{gray}{\textit{--- Budget enforcement ---}}
+  \While{$|z_t| > B$}
+    \State $i^* \leftarrow \arg\min_i \; r_i^{\mathrm{retain}}$ \Comment{$r_i^{\mathrm{retain}} = w_1 Q_i + w_2 \bar{\mu}_i + w_3 \mathrm{recency}(m_i)$}
+    \State $\textsc{Delete}(m_{i^*})$;\; $z_t \leftarrow z_t \setminus \{m_{i^*}\}$
+  \EndWhile
+
+\EndFor
+\end{algorithmic}
+\end{algorithm}

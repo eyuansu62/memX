@@ -62,7 +62,8 @@ class AlfworldRunner(BaseRunner):
                  valid_interval: int=2, test_interval: int=2, dataset_ratio: float=1.0, random_seed: int=42, bon: int=0,
                  ckpt_resume_enabled: bool = False, ckpt_resume_path: Optional[str] = None, ckpt_resume_epoch: Optional[int] = None,
                  baseline_mode: Optional[str] = None, baseline_k: int = 10,
-                 llm_judge: Optional[ALFWorldJudge] = None, llm_judge_alpha: float = 0.3):
+                 llm_judge: Optional[ALFWorldJudge] = None, llm_judge_alpha: float = 0.3,
+                 state_first: bool = True):
         self.agent = agent
         self.root = root
         self.memory_service = memory_service
@@ -87,6 +88,7 @@ class AlfworldRunner(BaseRunner):
         self.baseline_k = max(1, int(baseline_k))
         self.llm_judge: Optional[ALFWorldJudge] = llm_judge
         self.llm_judge_alpha: float = float(llm_judge_alpha)
+        self.state_first: bool = bool(state_first)
 
         self.rl_config: Optional[RLConfig] = rl_config
 
@@ -811,11 +813,26 @@ class AlfworldRunner(BaseRunner):
 
         logger.info("Constructing initial ReAct prompts for each game...")
         for i in range(current_bs):
-            messages_per_slot[i] = self.agent._construct_messages(
-                task_description=current_task_descs[i],
-                retrieved_memories=retrieved_mems_per_slot[i],
-                task_type=task_types[i]
-            )
+            if self.state_first and hasattr(self.memory_service, "compile_state"):
+                # State-first: compile structured state and use as primary context
+                state = self.memory_service.compile_state(
+                    current_task_descs[i],
+                    k=self.retrieve_k,
+                    threshold=getattr(self.rl_config, "sim_threshold", 0.0),
+                )
+                state_prompt = self.memory_service.format_state_prompt(state)
+                messages_per_slot[i] = self.agent._construct_messages_state_first(
+                    task_description=current_task_descs[i],
+                    state_prompt=state_prompt,
+                    task_type=task_types[i],
+                    raw_memories=retrieved_mems_per_slot[i],
+                )
+            else:
+                messages_per_slot[i] = self.agent._construct_messages(
+                    task_description=current_task_descs[i],
+                    retrieved_memories=retrieved_mems_per_slot[i],
+                    task_type=task_types[i]
+                )
 
         for step in tqdm(range(self.max_steps), desc="Sampling mini-batch (ReAct)"):
             if not messages_per_slot: # Break if all tasks are somehow finished
@@ -1049,6 +1066,12 @@ class AlfworldRunner(BaseRunner):
 
             logger.info("\n" + "#"*20 + f" STARTING SECTION {section_num}/{self.num_section}" + "#"*20)
 
+            # Epoch lifecycle: expire stale memories and enforce budget
+            if hasattr(self.memory_service, "begin_epoch"):
+                lifecycle = self.memory_service.begin_epoch(section_num)
+                if lifecycle.get("expired", 0) > 0 or lifecycle.get("evicted", 0) > 0:
+                    logger.info(f"Epoch lifecycle: {lifecycle}")
+
             # Notify event logger of current epoch
             _ev_log = getattr(getattr(self, "memory_service", None), "_mem_event_logger", None)
             if _ev_log is not None:
@@ -1148,6 +1171,17 @@ class AlfworldRunner(BaseRunner):
                     retrieved_memory_ids_list=retrieved_ids_list,
                     metadatas=metadatas_update
                 )
+
+                # Check for successful divergence and auto-refine
+                if hasattr(self.memory_service, "check_divergence_and_refine"):
+                    n_refined = self.memory_service.check_divergence_and_refine(
+                        task_descriptions=task_descriptions,
+                        trajectories=trajectories,
+                        successes=successes,
+                        retrieved_ids_list=retrieved_ids_list,
+                    )
+                    if n_refined > 0:
+                        logger.info(f"Divergence-triggered refine: {n_refined} memories rewritten")
 
                 logger.info(f"Mini-batch {i+1} memory update complete.")
 

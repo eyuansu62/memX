@@ -477,6 +477,14 @@ class BCBRunner:
                     retrieved_memory_ids_list=pending_retrieved_ids,
                     metadatas=pending_metadatas,
                 )
+                # Check for successful divergence and auto-refine
+                if hasattr(self.mem, "check_divergence_and_refine"):
+                    self.mem.check_divergence_and_refine(
+                        task_descriptions=pending_task_descriptions,
+                        trajectories=pending_trajectories,
+                        successes=pending_successes,
+                        retrieved_ids_list=pending_retrieved_ids,
+                    )
             except Exception:
                 logger.warning("BCB add_memories failed (batch)", exc_info=True)
             finally:
@@ -703,6 +711,12 @@ class BCBRunner:
         for epoch in range(1, self.num_epochs + 1):
             epoch_dir = os.path.join(self.output_dir, f"epoch{epoch}")
             os.makedirs(epoch_dir, exist_ok=True)
+
+            # Epoch lifecycle: expire stale memories and enforce budget
+            if hasattr(self.memsvc, "begin_epoch"):
+                lifecycle = self.memsvc.begin_epoch(epoch)
+                if lifecycle.get("expired", 0) > 0 or lifecycle.get("evicted", 0) > 0:
+                    logger.info(f"Epoch lifecycle: {lifecycle}")
 
             train_res = self._run_phase(
                 epoch=epoch,

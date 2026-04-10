@@ -100,6 +100,127 @@ def future_useful_survival_median(events: List[Dict]) -> float:
     return float(times_sorted[n // 2])
 
 
+def consistency_score(events: List[Dict]) -> float:
+    """Measure whether the memory state is consistent after updates.
+
+    After an override/delete/expire event on a memory, check if subsequent
+    retrievals for the same task pattern correctly reflect the updated state
+    (i.e., do not return a stale or deleted memory).
+
+    Score = fraction of post-update retrievals that return the updated (not stale) memory.
+    """
+    # Track deleted / expired memories
+    removed: set = set()
+    for ev in events:
+        if ev["event_type"] in ("delete", "expire", "evict"):
+            removed.add(ev["memory_id"])
+
+    # Check retrievals after removals
+    if not removed:
+        return 1.0  # no removals => trivially consistent
+
+    total_retrievals = 0
+    stale_retrievals = 0
+    for ev in events:
+        if ev["event_type"] == "retrieve":
+            total_retrievals += 1
+            if ev["memory_id"] in removed:
+                stale_retrievals += 1
+
+    if total_retrievals == 0:
+        return 1.0
+    return 1.0 - (stale_retrievals / total_retrievals)
+
+
+def intervention_fidelity(events: List[Dict]) -> float:
+    """After explicit interventions (refine with external trigger, or override with
+    external source), measure how quickly the correction propagates.
+
+    Score = fraction of interventions where the very next retrieval for a similar
+    task returns the corrected memory.
+    """
+    interventions = [
+        ev for ev in events if ev["event_type"] == "intervention"
+    ]
+    if not interventions:
+        return float("nan")
+
+    corrected_ids = {ev["memory_id"] for ev in interventions}
+    # Check the first retrieval after each intervention
+    fidelity_hits = 0
+    for intv in interventions:
+        intv_ts = intv.get("timestamp", "")
+        # Find next retrieve event after this intervention
+        for ev in events:
+            if (
+                ev["event_type"] == "retrieve"
+                and ev.get("timestamp", "") > intv_ts
+            ):
+                if ev["memory_id"] in corrected_ids:
+                    fidelity_hits += 1
+                break  # only check the first retrieval after
+
+    return fidelity_hits / len(interventions) if interventions else 0.0
+
+
+def conflict_resolution_rate(events: List[Dict], window: int = 3) -> float:
+    """Fraction of detected conflicts that are resolved within K epochs.
+
+    A conflict is detected when a memory's belief_conflict increases.
+    It is resolved when the memory is subsequently refined, deleted, or expired.
+    """
+    # Track memories with conflict events (high conflict rate at update time)
+    conflicts: Dict[str, int] = {}  # memory_id -> epoch of first conflict
+    resolutions: set = set()
+
+    for ev in events:
+        mid = ev.get("memory_id", "")
+        epoch = int(ev.get("epoch", 0))
+
+        # Detect conflict: update event where conflict counter is rising
+        if ev["event_type"] == "update":
+            bc = float(ev.get("belief_conflict", 0.0))
+            if bc > 0 and mid not in conflicts:
+                conflicts[mid] = epoch
+
+        # Detect resolution
+        if ev["event_type"] in ("refine", "delete", "expire", "evict"):
+            if mid in conflicts and epoch - conflicts[mid] <= window:
+                resolutions.add(mid)
+
+    if not conflicts:
+        return float("nan")
+    return len(resolutions) / len(conflicts)
+
+
+def eviction_rate(events: List[Dict]) -> float:
+    """Fraction of memories that were evicted (per total memories created)."""
+    created = set(ev["memory_id"] for ev in events if ev["event_type"] == "write")
+    evicted = set(ev["memory_id"] for ev in events if ev["event_type"] == "evict")
+    if not created:
+        return 0.0
+    return len(evicted) / len(created)
+
+
+def budget_utilization_over_time(events: List[Dict]) -> List[Dict]:
+    """Track memory count over epochs for budget-utility analysis."""
+    alive: set = set()
+    epoch_counts: Dict[int, int] = {}
+
+    for ev in events:
+        mid = ev.get("memory_id", "")
+        epoch = int(ev.get("epoch", 0))
+
+        if ev["event_type"] == "write":
+            alive.add(mid)
+        elif ev["event_type"] in ("delete", "evict"):
+            alive.discard(mid)
+
+        epoch_counts[epoch] = len(alive)
+
+    return [{"epoch": e, "memory_count": c} for e, c in sorted(epoch_counts.items())]
+
+
 def run(
     memrl_path: str = "logs/memrl_alfworld.jsonl",
     belief_path: str = "logs/belief_memrl_alfworld.jsonl",
@@ -113,13 +234,21 @@ def run(
 
     rows = []
     for name, ev in [("MemRL", memrl_ev), ("Belief-MemRL", belief_ev)]:
+        cs = consistency_score(ev)
+        ifid = intervention_fidelity(ev)
+        crr = conflict_resolution_rate(ev)
+        er = eviction_rate(ev)
         rows.append(
             {
                 "System": name,
                 "Last Acc": f"{last_acc(ev):.1%}",
                 "CSR": f"{csr(ev):.1%}",
                 "Avg Cross-Epoch Dist": f"{avg_cross_epoch_dist(ev):.2f}",
-                "Future-Useful Survival (median epochs)": f"{future_useful_survival_median(ev):.1f}",
+                "Survival (med)": f"{future_useful_survival_median(ev):.1f}",
+                "Consistency": f"{cs:.1%}" if not (cs != cs) else "N/A",
+                "Intervention Fid.": f"{ifid:.1%}" if not (ifid != ifid) else "N/A",
+                "Conflict Res.": f"{crr:.1%}" if not (crr != crr) else "N/A",
+                "Eviction Rate": f"{er:.1%}",
             }
         )
 

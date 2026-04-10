@@ -171,7 +171,11 @@ def main():
             sim_norm_mean=getattr(cfg.memory, 'sim_norm_mean', 0.1856827586889267),
             sim_norm_std=getattr(cfg.memory, 'sim_norm_std', 0.09407906234264374),
             vector_dimension=cfg.embedding.vector_dimension,
-            belief_config=BeliefConfig(),
+            memory_budget=getattr(cfg.memory, "memory_budget", 0),
+            budget_policy=getattr(cfg.memory, "budget_policy", "q_weighted"),
+            budget_check_interval=getattr(cfg.memory, "budget_check_interval", 1),
+            budget_utilization_threshold=getattr(cfg.memory, "budget_utilization_threshold", 0.8),
+            belief_config=cfg.belief.to_dataclass() if hasattr(cfg, "belief") else BeliefConfig(),
         )
 
         sel = HLESelection(
@@ -205,6 +209,7 @@ def main():
             ckpt_resume_epoch=getattr(cfg.experiment, "ckpt_resume_epoch", None),
             baseline_mode=getattr(cfg.experiment, "baseline_mode", False),
             baseline_k=getattr(cfg.experiment, "baseline_k", 0),
+            state_first=getattr(cfg.experiment, "state_first", False),
         )
         runner.run()
     except Exception as e:

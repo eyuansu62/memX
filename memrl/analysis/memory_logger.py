@@ -158,6 +158,134 @@ class MemoryEventLogger:
             ev.update(extra)
         self._write(ev)
 
+    def log_evict(
+        self,
+        memory_id: str,
+        eviction_score: float = 0.0,
+        policy: str = "q_weighted",
+        q_value: float = 0.0,
+        belief_alpha: float = 1.0,
+        belief_beta: float = 1.0,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("evict")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "eviction_score": eviction_score,
+                "policy": policy,
+                "q_value": q_value,
+                "belief_alpha": belief_alpha,
+                "belief_beta": belief_beta,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
+    def log_expire(
+        self,
+        memory_id: str,
+        created_epoch: int = 0,
+        ttl_epochs: int = 0,
+        current_epoch: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("expire")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "created_epoch": created_epoch,
+                "ttl_epochs": ttl_epochs,
+                "current_epoch": current_epoch,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
+    def log_delete(
+        self,
+        memory_id: str,
+        reason: str = "explicit",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("delete")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "reason": reason,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
+    def log_refine(
+        self,
+        memory_id: str,
+        trigger: str = "belief_instability",
+        q_value: float = 0.0,
+        belief_alpha: float = 1.0,
+        belief_beta: float = 1.0,
+        posterior_reset: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("refine")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "trigger": trigger,
+                "q_value": q_value,
+                "belief_alpha": belief_alpha,
+                "belief_beta": belief_beta,
+                "posterior_reset": posterior_reset,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
+    def log_intervention(
+        self,
+        memory_id: str,
+        operator: str = "refine",
+        source: str = "external",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("intervention")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "operator": operator,
+                "source": source,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
+    def log_redact(
+        self,
+        memory_id: str,
+        n_patterns: int = 0,
+        n_replacements: int = 0,
+        source: str = "explicit",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        ev = self._base("redact")
+        ev.update(
+            {
+                "memory_id": memory_id,
+                "n_patterns": n_patterns,
+                "n_replacements": n_replacements,
+                "source": source,
+            }
+        )
+        if extra:
+            ev.update(extra)
+        self._write(ev)
+
     def close(self) -> None:
         with self._lock:
             self._fh.close()
