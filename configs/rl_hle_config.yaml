@@ -1,18 +1,18 @@
 # LLM provider configuration
 llm:
   provider: "openai"
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  model: "gemini-3-pro"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen3-4B-Instruct-2507"
   temperature: 0.6
   max_tokens: 65536
 
-# Embedding provider configuration  
+# Embedding provider configuration
 embedding:
   provider: "openai"
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  model: "text-embedding-3-large"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1"
+  model: "Qwen3-Embedding-4B"
   max_text_len: 4096
 
 # Memory system configuration
@@ -50,6 +50,7 @@ experiment:
   batch_size: 32  # Number of parallel environments for sampling.
   dataset_ratio: 1.0  # Proportion of files randomly selected for training (rest used for validation)
   train_valid_split: 1.0  # Ratio to split training and validation sets
+  state_first: true
   ckpt_eval_enabled: false
   ckpt_eval_path: ""
   baseline_mode: null   # passk
@@ -64,13 +65,13 @@ experiment:
 
 # Belief-augmented memory config (BeliefMemoryService).
 # Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
-# belief:
-#   weight_legacy: 0.45
-#   weight_belief_similarity: 0.25
-#   weight_belief_posterior: 0.20
-#   weight_conflict_penalty: 0.10
-#   auto_refine_conflict_threshold: 0.5
-#   auto_refine_min_reuse: 3
+belief:
+  weight_legacy: 0.45
+  weight_belief_similarity: 0.25
+  weight_belief_posterior: 0.20
+  weight_conflict_penalty: 0.10
+  auto_refine_conflict_threshold: 0.5
+  auto_refine_min_reuse: 3
 
 # RL Configs:
 rl_config:

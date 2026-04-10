@@ -16,18 +16,18 @@
 llm:  # LLM (chat/completions) provider settings.
   # OpenAI-compatible chat completions endpoint (OpenAI, vLLM, etc.).
   provider: "openai"                # LLM provider name (used by run/run_llb.py to set OpenAI client).
-  api_key: "API"          # LLM API key (required).
-  base_url: "BASEURL"  # LLM API base URL (OpenAI-compatible).
-  model: "gpt-4o-mini"              # Chat model name.
+  api_key: "EMPTY"          # LLM API key (required).
+  base_url: "http://localhost:8000/v1"  # LLM API base URL (OpenAI-compatible).
+  model: "Qwen3-4B-Instruct-2507"              # Chat model name.
   temperature: 0.0                  # Sampling temperature.
   # Keep null to let the provider decide; set a number to cap output length.
   max_tokens: 10240                  # Max output tokens per LLM call (null = provider default).
 
 embedding:  # Embedding provider settings.
   provider: "openai"                # Embedding provider name (used by run/run_llb.py to set OpenAI client).
-  api_key: "API"          # Embedding API key (required).
-  base_url: "BASEURL"  # Embedding API base URL (OpenAI-compatible).
-  model: "text-embedding-3-large"   # Embedding model name.
+  api_key: "EMPTY"          # Embedding API key (required).
+  base_url: "http://localhost:8001/v1"  # Embedding API base URL (OpenAI-compatible).
+  model: "Qwen3-Embedding-4B"   # Embedding model name.
   # 0 disables chunking; otherwise longer inputs are chunked and averaged.
   max_text_len: 8196                # Max chars per embed call before chunking/averaging (0 disables).
 
@@ -95,6 +95,7 @@ experiment:  # Experiment / runner settings.
   enable_value_driven: true    # Enable value-driven behaviors in MemoryService.
   random_seed: 42              # Random seed for reproducibility (sampling, splits, etc.).
   mode: "train"                # train | test (runner may interpret this).
+  state_first: true
 
   # LLB dataset controls
   task: "os"                   # LLB task type: db | os | kg (also accepts "db_bench" / "os_interaction").
@@ -147,13 +148,13 @@ experiment:  # Experiment / runner settings.
 
 # Belief-augmented memory config (BeliefMemoryService).
 # Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
-# belief:
-#   weight_legacy: 0.45
-#   weight_belief_similarity: 0.25
-#   weight_belief_posterior: 0.20
-#   weight_conflict_penalty: 0.10
-#   auto_refine_conflict_threshold: 0.5
-#   auto_refine_min_reuse: 3
+belief:
+  weight_legacy: 0.45
+  weight_belief_similarity: 0.25
+  weight_belief_posterior: 0.20
+  weight_conflict_penalty: 0.10
+  auto_refine_conflict_threshold: 0.5
+  auto_refine_min_reuse: 3
 
 rl_config:  # RL/value-driven knobs used by MemoryService and runners.
   epsilon: 0.01                 # Epsilon-greedy exploration probability for value-aware selection.

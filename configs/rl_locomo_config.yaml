@@ -1,18 +1,18 @@
 # LLM provider configuration
 llm:
   provider: "openai"
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4-turbo"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen3-4B-Instruct-2507"
   temperature: 0.0
   max_tokens: 256
 
 # Embedding provider configuration
 embedding:
   provider: "openai"
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  model: "text-embedding-3-large"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1"
+  model: "Qwen3-Embedding-4B"
   max_text_len: 4096
   vector_dimension: 3072
 
@@ -58,16 +58,17 @@ experiment:
   ckpt_resume_enabled: false
   ckpt_resume_path: ""
   ckpt_resume_epoch: 0
+  state_first: true
 
 # Belief-augmented memory config (BeliefMemoryService).
 # Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
-# belief:
-#   weight_legacy: 0.45
-#   weight_belief_similarity: 0.25
-#   weight_belief_posterior: 0.20
-#   weight_conflict_penalty: 0.10
-#   auto_refine_conflict_threshold: 0.5
-#   auto_refine_min_reuse: 3
+belief:
+  weight_legacy: 0.45
+  weight_belief_similarity: 0.25
+  weight_belief_posterior: 0.20
+  weight_conflict_penalty: 0.10
+  auto_refine_conflict_threshold: 0.5
+  auto_refine_min_reuse: 3
 
 # RL Configs
 rl_config:

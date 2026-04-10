@@ -15,10 +15,10 @@ llm:
   provider: "openai"
   # NOTE: do not commit real keys/endpoints in this file.
   # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1"
   api_version: null
-  model: "gpt-4o-mini"
+  model: "Qwen3-4B-Instruct-2507"
   temperature: 0.0
   max_tokens: 12800
 
@@ -26,10 +26,10 @@ embedding:
   provider: "openai"
   # NOTE: do not commit real keys/endpoints in this file.
   # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1"
   api_version: null
-  model: "text-embedding-3-large"
+  model: "Qwen3-Embedding-4B"
   max_text_len: 8196
 
 memory:
@@ -74,6 +74,7 @@ experiment:
   bcb_run_validation: false
   random_seed: 42
   mode: "train"
+  state_first: true
 
 
   dataset_ratio: 0.7
@@ -100,13 +101,13 @@ experiment:
 
 # Belief-augmented memory config (BeliefMemoryService).
 # Uncomment and override individual fields as needed; all defaults match BeliefConfig dataclass.
-# belief:
-#   weight_legacy: 0.45
-#   weight_belief_similarity: 0.25
-#   weight_belief_posterior: 0.20
-#   weight_conflict_penalty: 0.10
-#   auto_refine_conflict_threshold: 0.5
-#   auto_refine_min_reuse: 3
+belief:
+  weight_legacy: 0.45
+  weight_belief_similarity: 0.25
+  weight_belief_posterior: 0.20
+  weight_conflict_penalty: 0.10
+  auto_refine_conflict_threshold: 0.5
+  auto_refine_min_reuse: 3
 
 rl_config:
   epsilon: 0.1
