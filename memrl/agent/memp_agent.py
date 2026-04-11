@@ -215,21 +215,44 @@ class MempAgent(BaseAgent):
             )
             messages.append({"role": "system", "content": state_context})
 
-        # Optional: raw memories as fallback (truncated)
+        # Raw memories as supporting evidence (full content for trajectory-heavy tasks)
         if raw_memories:
             successful_mems = raw_memories.get('successed', [])
+            failed_mems = raw_memories.get('failed', [])
+
+            memory_parts = []
             if successful_mems:
-                truncated = []
-                for mem in successful_mems[:2]:  # at most 2 raw memories as backup
+                formatted = []
+                for mem in successful_mems:
                     content = self._format_retrieved_memory(mem.get('content', ''))
                     if content:
-                        truncated.append(content[:300] + "..." if len(content) > 300 else content)
-                if truncated:
-                    fallback = (
-                        "Supporting evidence from raw memory (for reference only):\n" +
-                        "\n---\n".join(truncated)
+                        formatted.append(content)
+                if formatted:
+                    memory_parts.append(
+                        "--- SUCCESSFUL MEMORIES (Examples to follow) ---\n" +
+                        "\n".join(formatted)
                     )
-                    messages.append({"role": "system", "content": fallback})
+
+            if failed_mems:
+                formatted = []
+                for mem in failed_mems:
+                    content = self._format_retrieved_memory(mem.get('content', ''))
+                    if content:
+                        formatted.append(content)
+                if formatted:
+                    memory_parts.append(
+                        "--- FAILED MEMORIES (Examples to avoid or learn from) ---\n" +
+                        "\n".join(formatted)
+                    )
+
+            if memory_parts:
+                fallback = (
+                    "Supporting evidence from past experiences "
+                    "(the operating state above summarizes reliability; "
+                    "details below for reference):\n\n" +
+                    "\n\n".join(memory_parts)
+                )
+                messages.append({"role": "system", "content": fallback})
 
         # Current task
         current_task_prompt = f"Now, it's your turn to solve a new task.\n{task_description}"

@@ -1110,7 +1110,7 @@ class BeliefMemoryService(MemoryService):
             entry = {
                 "memory_id": memory_id,
                 "belief_key": str(belief_key)[:100],
-                "content_summary": str(content)[:500] if content else "",
+                "content_summary": str(content)[:2000] if content else "",
                 "posterior_mean": round(posterior_mean, 3),
                 "posterior_var": round(posterior_var, 4),
                 "conflict_rate": round(conflict_rate, 3),
@@ -1159,13 +1159,12 @@ class BeliefMemoryService(MemoryService):
             for i, entry in enumerate(active, 1):
                 success_str = f"success rate {entry['posterior_mean']:.0%}" if entry["reuse_count"] > 0 else "untested"
                 line = (
-                    f"  {i}. {entry['belief_key']}: "
+                    f"  {i}. [{entry['belief_key']}] "
                     f"{success_str} ({entry['reuse_count']} uses, Q={entry['q_value']:.2f})"
                 )
                 if entry["content_summary"]:
-                    # Extract first line of content as strategy hint
-                    first_line = entry["content_summary"].split("\n")[0][:150]
-                    line += f"\n     Strategy: {first_line}"
+                    # Include full content (up to 500 chars) so agent can follow concrete steps
+                    line += f"\n     Strategy:\n{entry['content_summary']}"
                 parts.append(line)
 
         if uncertain:
