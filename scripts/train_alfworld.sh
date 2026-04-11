@@ -31,11 +31,7 @@ EMBED_LOG=/tmp/vllm_embed.log
 
 # ── Training ─────────────────────────────────────────────────────────────────
 TRAIN_LOG=$PROJECT/alfworld_train.log
-CONFIG=$PROJECT/configs/rl_alf_config.local.yaml
-# Fall back to default config if local one doesn't exist
-if [ ! -f "$CONFIG" ]; then
-    CONFIG=$PROJECT/configs/rl_alf_config.yaml
-fi
+CONFIG=$PROJECT/configs/rl_alf_config.yaml
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 wait_for_server() {

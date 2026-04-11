@@ -1,7 +1,8 @@
 # FILE: memp/agent/memp_agent.py
 
 import logging
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Optional
 import copy
 import ast
 
@@ -11,6 +12,11 @@ from . import prompts
 from memrl.providers.llm import OpenAILLM
 
 logger = logging.getLogger(__name__)
+
+# Compiled regex for structural delimiters in memory content
+_TRAJECTORY_DELIM = re.compile(r'\n\nTRAJECTORY:\n')
+_FAILED_APPROACH_DELIM = re.compile(r'\n\nFailed approach:\n')
+_ADJUSTMENT_NOTE_DELIM = re.compile(r'\n\n--- ADJUSTMENT NOTE \(.*?\) ---\n')
 
 class MempAgent(BaseAgent):
     """
@@ -48,88 +54,145 @@ class MempAgent(BaseAgent):
                         return copy.deepcopy(example['example'])
         return "No specific examples found for this task type."
 
+    def _extract_list_from_str(self, text: str) -> Optional[list]:
+        """Find the first top-level [...] in *text* by bracket counting,
+        then parse it with ast.literal_eval.  Returns the parsed list or None."""
+        start = text.find('[')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape_next = False
+        quote_char = None
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if in_string:
+                if ch == quote_char:
+                    in_string = False
+                continue
+            if ch in ('"', "'"):
+                in_string = True
+                quote_char = ch
+                continue
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        result = ast.literal_eval(candidate)
+                        if isinstance(result, list):
+                            return result
+                    except Exception:
+                        pass
+                    return None
+        return None
+
+    def _format_trajectory_list(self, trajectory_list: list) -> str:
+        """Format a parsed trajectory list into clean text for the agent."""
+        # Keep only the portion after the last "Now, it's your turn"
+        turn_idx = -1
+        for i, msg in enumerate(trajectory_list):
+            if (isinstance(msg, dict)
+                    and msg.get("role") == "user"
+                    and isinstance(msg.get("content", ""), str)
+                    and "Now, it's your turn" in msg["content"]):
+                turn_idx = i
+        if turn_idx != -1:
+            trajectory_list = trajectory_list[turn_idx:]
+
+        clean_trajectory = []
+        for message in trajectory_list:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            if role == "assistant":
+                clean_trajectory.append(f"> {content}")
+            elif role == "user" and content.strip().startswith("Observation:"):
+                clean_trajectory.append(content)
+
+        if clean_trajectory:
+            return "Archived Trajectory:\n" + "\n".join(clean_trajectory)
+        return ""
+
     def _format_retrieved_memory(self, raw_content: str) -> str:
         """
-        [NEW HELPER METHOD]
         Parses the raw memory content to extract only the most useful parts
         (SCRIPT and the core Thought/Action/Observation sequence), removing
         redundant headers, system prompts, and old task descriptions.
+
+        Handles five memory content formats:
+        1. Proceduralization  (SCRIPT + TRAJECTORY delimiter)
+        2. Adjustment/Reflection  (What went wrong + Failed approach delimiter)
+        3. Raw trajectory  (Python list string, no delimiter)
+        4. Script only  (plain text, no trajectory list)
+        5. Inplace adjustment  (TRAJECTORY + trailing ADJUSTMENT NOTE)
         """
-        try:
-            header = ""
-            trajectory_str = raw_content
-            # 1. Split the content into the header (Task, Script) and the trajectory part
-            if 'TRAJECTORY' in raw_content:
-                header, trajectory_str = raw_content.split('\n\nTRAJECTORY:\n', 1)
-            elif 'Failed approach' in raw_content:
-                header, trajectory_str = raw_content.split('\n\nFailed approach:\n', 1) 
+        if not raw_content or not raw_content.strip():
+            return ""
 
-            clean_parts = []
-            
-            # 2. Extract the high-level SCRIPT or reflection if it exists
+        clean_parts = []
+        trajectory_list = None
+
+        # --- Format 1 & 5: SCRIPT + TRAJECTORY delimiter ---
+        traj_match = _TRAJECTORY_DELIM.search(raw_content)
+        if traj_match:
+            header = raw_content[:traj_match.start()]
+            trajectory_region = raw_content[traj_match.end():]
+
+            # Strip trailing adjustment notes (Format 5)
+            adj_match = _ADJUSTMENT_NOTE_DELIM.search(trajectory_region)
+            if adj_match:
+                trajectory_region = trajectory_region[:adj_match.start()]
+
             if 'SCRIPT:' in header:
-                script_part = header.split('SCRIPT:')[1].strip()
+                script_part = header.split('SCRIPT:', 1)[1].strip()
                 clean_parts.append(f"Archived Script:\n{script_part}")
+
+            trajectory_list = self._extract_list_from_str(trajectory_region)
+
+        # --- Format 2: TASK REFLECTION + Failed approach ---
+        elif _FAILED_APPROACH_DELIM.search(raw_content):
+            fa_match = _FAILED_APPROACH_DELIM.search(raw_content)
+            header = raw_content[:fa_match.start()]
+            trajectory_region = raw_content[fa_match.end():]
+
             if 'What went wrong:' in header:
-                reflection_part = header.split('What went wrong:')[1].strip()
-                clean_parts.append(f"Archived Script:\n{reflection_part}")                
-            # 3. Parse the trajectory string into a Python list
-            # ast.literal_eval is a safe way to evaluate a string containing a Python literal
-            trajectory_list = ast.literal_eval(trajectory_str)
-            
-            # 4. Keep only the portion after the last "Now, it's your turn"
-            turn_idx = -1
-            for i, msg in enumerate(trajectory_list):
-                if msg.get("role") == "user" and isinstance(msg.get("content", ""), str) and "Now, it's your turn" in msg["content"]:
-                    turn_idx = i
-            if turn_idx != -1:
-                trajectory_list = trajectory_list[turn_idx:]
+                reflection_part = header.split('What went wrong:', 1)[1].strip()
+                clean_parts.append(f"Archived Reflection:\n{reflection_part}")
 
-            clean_trajectory = []
-            for message in trajectory_list:
-                role = message.get("role")
-                content = message.get("content", "")
-                if role == "assistant":
-                    clean_trajectory.append(f"> {content}")
-                elif role == "user" and isinstance(content, str):
-                    clean_trajectory.append(content)
-            
-            if clean_trajectory:
-                clean_parts.append("Archived Trajectory:\n" + "\n".join(clean_trajectory))
-            
-            return "\n\n".join(clean_parts)
-            
-        except Exception as e:
-            logger.warning(f"Could not parse retrieved memory content, using raw content. Error: {e}")
-            idx = raw_content.find('[')
-            if idx != -1:
-                raw_content = raw_content[idx:]
-            # Fallback to returning the raw content if parsing fails
-            try:
-                trajectory_list = ast.literal_eval(raw_content)
-            except Exception:
-                return raw_content
+            trajectory_list = self._extract_list_from_str(trajectory_region)
 
-            # 4. Keep only the portion after the last "Now, it's your turn"
-            turn_idx = -1
-            for i, msg in enumerate(trajectory_list):
-                if msg.get("role") == "user" and isinstance(msg.get("content", ""), str) and "Now, it's your turn" in msg["content"]:
-                    turn_idx = i
-            if turn_idx != -1:
-                trajectory_list = trajectory_list[turn_idx:]
+        # --- Format 3: Raw trajectory (no delimiter, list present) ---
+        elif '[' in raw_content:
+            trajectory_list = self._extract_list_from_str(raw_content)
 
-            clean_trajectory = []
-            for message in trajectory_list:
-                role = message.get("role")
-                content = message.get("content", "")
-                if role == "assistant":
-                    clean_trajectory.append(f"> {content}")
-                elif role == "user" and isinstance(content, str) and content.startswith("Observation:"):
-                    clean_trajectory.append(content)
-            
-            if clean_trajectory:
-                clean_parts.append("Archived Trajectory:\n" + "\n".join(clean_trajectory))
-            return "\n\n".join(clean_parts)
+        # --- Format trajectory if found ---
+        if trajectory_list and isinstance(trajectory_list, list):
+            formatted = self._format_trajectory_list(trajectory_list)
+            if formatted:
+                clean_parts.append(formatted)
+        elif not clean_parts:
+            # Format 4 or completely unparseable: return cleaned raw content
+            cleaned = raw_content.strip()
+            if cleaned.startswith('Task:'):
+                lines = cleaned.split('\n', 1)
+                if len(lines) > 1:
+                    cleaned = lines[1].strip()
+            if cleaned:
+                clean_parts.append(f"Archived Note:\n{cleaned}")
+
+        return "\n\n".join(clean_parts) if clean_parts else ""
         
     def _construct_messages(self, task_description: str, retrieved_memories: List[Dict], task_type: str) -> List[Dict[str, str]]:
         """
