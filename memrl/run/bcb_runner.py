@@ -91,6 +91,7 @@ class BCBRunner:
         bcb_repo: Optional[str] = None,
         untrusted_hard_timeout_s: float = 120.0,
         eval_timeout_s: float = 60.0,
+        state_first: bool = False,
     ) -> None:
         self.root = Path(root)
         self.sel = selection
@@ -112,6 +113,7 @@ class BCBRunner:
         self.bcb_repo = bcb_repo
         self.untrusted_hard_timeout_s = float(untrusted_hard_timeout_s)
         self.eval_timeout_s = float(eval_timeout_s)
+        self.state_first = bool(state_first)
 
         ensure_bigcodebench_on_path(self.bcb_repo)
 
@@ -521,16 +523,33 @@ class BCBRunner:
                         for m in selected_mems
                         if isinstance(m, dict) and (m.get("memory_id") or m.get("id"))
                     ]
-                    mem_context = self._format_memory_context(selected_mems)
+                    # State-first: compile structured state view if available
+                    if self.state_first and hasattr(self.mem, "compile_state"):
+                        try:
+                            state = self.mem.compile_state(prompt, k=self.retrieve_k, threshold=thr)
+                            state_prompt = self.mem.format_state_prompt(state)
+                            if state_prompt and state_prompt.strip():
+                                mem_context = (
+                                    "Below is your current operating state — a pre-processed summary of "
+                                    "relevant memories, ranked by reliability and relevance. Use this as "
+                                    "your primary decision context:\n\n" + state_prompt
+                                )
+                            else:
+                                mem_context = self._format_memory_context(selected_mems)
+                        except Exception:
+                            logger.debug("BCB state compilation failed, falling back to raw memories", exc_info=True)
+                            mem_context = self._format_memory_context(selected_mems)
+                    else:
+                        mem_context = self._format_memory_context(selected_mems)
                     try:
                         retrieval_trace = {
-                            "mode": "retrieve_query",
+                            "mode": "compile_state" if self.state_first else "retrieve_query",
                             "retrieved_count": len(selected_ids),
                             "simmax": float((ret_result or {}).get("simmax", 0.0) or 0.0),
                         }
                     except Exception:
                         retrieval_trace = {
-                            "mode": "retrieve_query",
+                            "mode": "compile_state" if self.state_first else "retrieve_query",
                             "retrieved_count": len(selected_ids),
                             "simmax": 0.0,
                         }

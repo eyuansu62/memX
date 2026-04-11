@@ -98,6 +98,10 @@ class BeliefConfig:
     auto_refine_conflict_threshold: float = 0.5
     auto_refine_min_reuse: int = 3  # only trigger after this many reuse events
 
+    # State compilation thresholds for active/uncertain partitioning.
+    state_variance_threshold: float = 0.25    # posterior variance above this → uncertain
+    state_conflict_threshold: float = 0.3     # conflict rate above this → uncertain
+
 
 class BeliefMemoryService(MemoryService):
     """
@@ -901,11 +905,35 @@ class BeliefMemoryService(MemoryService):
         elif operator == "refine":
             self.refine_memory(memory_id, trigger=f"intervention:{source}", reset_posterior=reset_posterior)
         elif operator == "override" and new_text is not None:
-            # Replace memory content
+            # Replace memory content and re-sync belief metadata
             try:
                 text_mem = self._get_text_mem()
                 text_mem.update(memory_id, {"id": memory_id, "memory": new_text})
                 self._mem_cache.pop(memory_id, None)
+
+                # Recompute belief key/text from new content to keep metadata in sync
+                new_belief = self._compose_belief_text(new_text)
+                belief_sync_patch = {
+                    "belief_key": new_belief.get("belief_key", ""),
+                    "belief_text": new_belief.get("belief_text", ""),
+                    "belief_terms": new_belief.get("belief_terms", []),
+                    "belief_constraints": new_belief.get("belief_constraints", []),
+                }
+                if reset_posterior:
+                    cfg = self.belief_config
+                    belief_sync_patch["belief_alpha"] = cfg.prior_alpha
+                    belief_sync_patch["belief_beta"] = cfg.prior_beta
+                    belief_sync_patch["belief_conflict"] = 0.0
+                    belief_sync_patch["belief_score"] = cfg.prior_alpha / max(cfg.prior_alpha + cfg.prior_beta, 1e-8)
+                self._patch_metadata(memory_id, belief_sync_patch)
+
+                # Update caches
+                bt = belief_sync_patch.get("belief_text", "")
+                if bt:
+                    self._belief_text_cache[memory_id] = bt
+                    vec = self._embed_text(bt)
+                    if vec is not None:
+                        self._belief_embedding_cache[memory_id] = vec
             except Exception:
                 pass
 
@@ -1059,7 +1087,9 @@ class BeliefMemoryService(MemoryService):
 
         active = []
         uncertain = []
-        variance_threshold = 0.25  # Beta variance threshold for uncertainty
+        cfg = self.belief_config
+        variance_threshold = cfg.state_variance_threshold
+        conflict_threshold = cfg.state_conflict_threshold
 
         for c in candidates:
             meta = _meta_to_dict(c.get("metadata", {}))
@@ -1089,7 +1119,7 @@ class BeliefMemoryService(MemoryService):
                 "success": success_flag,
             }
 
-            if posterior_var > variance_threshold or conflict_rate > 0.3:
+            if posterior_var > variance_threshold or conflict_rate > conflict_threshold:
                 uncertain.append(entry)
             else:
                 active.append(entry)
@@ -1141,7 +1171,7 @@ class BeliefMemoryService(MemoryService):
         if uncertain:
             parts.append("\n[UNCERTAIN — Use with caution]")
             for i, entry in enumerate(uncertain, 1):
-                reason = "high conflict" if entry["conflict_rate"] > 0.3 else "low confidence"
+                reason = "high conflict" if entry["conflict_rate"] > self.belief_config.state_conflict_threshold else "low confidence"
                 parts.append(
                     f"  {i}. {entry['belief_key']}: "
                     f"{entry['posterior_mean']:.0%} success, {reason} "

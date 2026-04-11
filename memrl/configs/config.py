@@ -293,6 +293,10 @@ class BeliefConfigModel(BaseModel):
     auto_refine_conflict_threshold: float = Field(default=0.5, ge=0, le=1, description="Conflict rate above which auto-refine fires")
     auto_refine_min_reuse: int = Field(default=3, ge=1, description="Minimum reuse events before auto-refine eligible")
 
+    # State compilation thresholds.
+    state_variance_threshold: float = Field(default=0.25, ge=0.0, le=1.0, description="Posterior variance above this → uncertain in state view")
+    state_conflict_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="Conflict rate above this → uncertain in state view")
+
     def to_dataclass(self):
         """Convert to the ``BeliefConfig`` dataclass expected by BeliefMemoryService.
 

@@ -268,6 +268,7 @@ def main() -> None:
         bcb_repo=args.bcb_repo,
         untrusted_hard_timeout_s=float(args.untrusted_hard_timeout),
         eval_timeout_s=float(args.eval_timeout),
+        state_first=getattr(cfg.experiment, "state_first", False),
     )
 
     logger.info("BCB run_dir: %s", run_dir)
