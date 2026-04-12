@@ -1,19 +1,18 @@
 # LLM provider configuration
 llm:
   provider: "openai"
-  api_key: "EMPTY"
-  base_url: "http://localhost:8002/v1"
-  model: "Qwen3-30B-A3B-Instruct-2507-FP8"
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-5-mini"
   temperature: 0
   max_tokens: 4096
 
 # Embedding provider configuration
 embedding:
   provider: "openai"
-  api_key: "EMPTY"
-  base_url: "http://localhost:8001/v1"
-  model: "Qwen3-Embedding-4B"
-  vector_dimension: 2560
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  model: "text-embedding-3-large"
   max_text_len: 4096
 
 # Memory system configuration
@@ -49,7 +48,7 @@ experiment:
   mode: 'train'  # control whether to only test, if set as 'test' won't run on train spilt.
   num_sections: 10  # Number of sections (re-uses the same training set each section)
   batch_size: 32  # Number of parallel environments for sampling.
-  dataset_ratio: 1.0  # Proportion of files randomly selected for training (rest used for validation)
+  dataset_ratio: 0.2  # Proportion of files randomly selected for training (rest used for validation)
   few_shot_path: 'configs/alfworld/alfworld_examples.json' # path for alfworld examples
   state_first: true
   baseline_mode: none   # passk
