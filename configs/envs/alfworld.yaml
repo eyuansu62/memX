@@ -1,13 +1,13 @@
 dataset:
-  data_path: '/home/qinbowen/.cache/alfworld/json_2.1.1/train'
-  eval_id_data_path: '/home/qinbowen/.cache/alfworld/json_2.1.1/valid_seen'
-  eval_ood_data_path: '/home/qinbowen/.cache/alfworld/json_2.1.1/valid_unseen'
+  data_path: '/home/qinbowen/MemRL/data/alfworld/json_2.1.1/train'
+  eval_id_data_path: '/home/qinbowen/MemRL/data/alfworld/json_2.1.1/valid_seen'
+  eval_ood_data_path: '/home/qinbowen/MemRL/data/alfworld/json_2.1.1/valid_unseen'
   num_train_games: -1
   num_eval_games: -1
 
 logic:
-  domain: '/home/qinbowen/.cache/alfworld/logic/alfred.pddl'
-  grammar: '/home/qinbowen/.cache/alfworld/logic/alfred.twl2'
+  domain: '/home/qinbowen/MemRL/data/alfworld/logic/alfred.pddl'
+  grammar: '/home/qinbowen/MemRL/data/alfworld/logic/alfred.twl2'
 
 env:
   type: 'AlfredTWEnv'

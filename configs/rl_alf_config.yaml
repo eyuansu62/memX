@@ -2,8 +2,8 @@
 llm:
   provider: "openai"
   api_key: "EMPTY"
-  base_url: "http://localhost:8000/v1"
-  model: "Qwen3-4B-Instruct-2507"
+  base_url: "http://localhost:8002/v1"
+  model: "Qwen3-30B-A3B-Instruct-2507-FP8"
   temperature: 0
   max_tokens: 4096
 
@@ -13,8 +13,8 @@ embedding:
   api_key: "EMPTY"
   base_url: "http://localhost:8001/v1"
   model: "Qwen3-Embedding-4B"
-  max_text_len: 4096
   vector_dimension: 2560
+  max_text_len: 4096
 
 # Memory system configuration
 memory:
@@ -28,7 +28,7 @@ memory:
   max_keywords: 8
   confidence_threshold: 0.0
   memory_confidence: 100.0
-  add_similarity_threshold: 0.90 
+  add_similarity_threshold: 0.90
   # MemOS configuration
   mos_config_path: "configs/mos_config_final.json"
   user_id: "memrl_user"
@@ -49,7 +49,7 @@ experiment:
   mode: 'train'  # control whether to only test, if set as 'test' won't run on train spilt.
   num_sections: 10  # Number of sections (re-uses the same training set each section)
   batch_size: 32  # Number of parallel environments for sampling.
-  dataset_ratio: 0.2  # Proportion of files randomly selected for training (rest used for validation)
+  dataset_ratio: 1.0  # Proportion of files randomly selected for training (rest used for validation)
   few_shot_path: 'configs/alfworld/alfworld_examples.json' # path for alfworld examples
   state_first: true
   baseline_mode: none   # passk
@@ -71,8 +71,8 @@ belief:
   weight_belief_similarity: 0.25
   weight_belief_posterior: 0.20
   weight_conflict_penalty: 0.10
-  auto_refine_conflict_threshold: 0.5
-  auto_refine_min_reuse: 3
+  auto_refine_conflict_threshold: 0.75
+  auto_refine_min_reuse: 5
 
 # RL Configs:s
 rl_config:

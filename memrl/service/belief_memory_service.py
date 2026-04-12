@@ -994,7 +994,7 @@ class BeliefMemoryService(MemoryService):
         trajectories: List[str],
         successes: List[bool],
         retrieved_ids_list: List[List[str]],
-        divergence_threshold: float = 0.35,
+        divergence_threshold: float = 0.6,
     ) -> int:
         """Check for successful divergence and trigger Refine where needed.
 
