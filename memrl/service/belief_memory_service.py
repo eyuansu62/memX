@@ -29,6 +29,7 @@ changes three places:
   posterior inside memory metadata.
 """
 
+import concurrent.futures
 from dataclasses import dataclass
 import math
 import re
@@ -1013,7 +1014,8 @@ class BeliefMemoryService(MemoryService):
         Returns:
             Number of memories refined due to divergence.
         """
-        refined_count = 0
+        # Phase 1: screen candidates (fast — no LLM calls)
+        refine_jobs: list[tuple[str, str, str]] = []  # (mid, traj, td)
         for i, (td, traj, succ) in enumerate(zip(task_descriptions, trajectories, successes)):
             if not succ:
                 continue  # Only trigger on success
@@ -1021,7 +1023,6 @@ class BeliefMemoryService(MemoryService):
             if not mem_ids:
                 continue
 
-            # Compare trajectory against each retrieved memory's content
             new_terms = set(self._tokenize(traj[:1500])) - _STOPWORDS
             if len(new_terms) < 3:
                 continue
@@ -1038,22 +1039,35 @@ class BeliefMemoryService(MemoryService):
                     if not mem_terms:
                         continue
 
-                    # Jaccard overlap as divergence measure
                     overlap = len(new_terms & mem_terms) / max(len(new_terms | mem_terms), 1)
                     if overlap < divergence_threshold:
-                        # Trajectory diverged significantly from memory — refine
-                        self.refine_memory(
-                            str(mid),
-                            trigger="successful_divergence",
-                            reset_posterior=False,
-                            new_trajectory=traj,
-                            task_description=td,
-                            success=True,
-                        )
-                        refined_count += 1
+                        refine_jobs.append((str(mid), traj, td))
                 except Exception:
                     continue
-        return refined_count
+
+        if not refine_jobs:
+            return 0
+
+        # Phase 2: parallel LLM rewrites
+        def _do_refine(job: tuple[str, str, str]) -> None:
+            mid, traj, td = job
+            try:
+                self.refine_memory(
+                    mid,
+                    trigger="successful_divergence",
+                    reset_posterior=False,
+                    new_trajectory=traj,
+                    task_description=td,
+                    success=True,
+                )
+            except Exception:
+                pass
+
+        max_workers = min(len(refine_jobs), 16)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_do_refine, refine_jobs))
+
+        return len(refine_jobs)
 
     # ------------------------------------------------------------------
     # State-first v2: lightweight belief annotation (no extra retrieval)
