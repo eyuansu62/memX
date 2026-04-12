@@ -1063,7 +1063,7 @@ class BeliefMemoryService(MemoryService):
             except Exception:
                 pass
 
-        max_workers = min(len(refine_jobs), 16)
+        max_workers = min(len(refine_jobs), 4)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             list(pool.map(_do_refine, refine_jobs))
 
