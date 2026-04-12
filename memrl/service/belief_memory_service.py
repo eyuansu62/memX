@@ -1056,6 +1056,67 @@ class BeliefMemoryService(MemoryService):
         return refined_count
 
     # ------------------------------------------------------------------
+    # State-first v2: lightweight belief annotation (no extra retrieval)
+    # ------------------------------------------------------------------
+
+    def annotate_memories(self, retrieved_mems: Dict[str, list]) -> Dict[str, Dict]:
+        """Attach belief annotations to already-retrieved memories.
+
+        Unlike ``compile_state``, this method does **no retrieval** — it simply
+        reads the belief metadata that is already present on each memory dict
+        and returns a mapping from ``memory_id`` to an annotation dict.
+
+        Args:
+            retrieved_mems: ``{"successed": [...], "failed": [...]}``, the
+                same structure produced by ``process_retrieve_mems``.
+
+        Returns:
+            ``{memory_id: {"confidence": "confident"|"uncertain",
+                           "label": str,
+                           "sort_key": float}}``
+        """
+        cfg = self.belief_config
+        var_thr = cfg.state_variance_threshold
+        conf_thr = cfg.state_conflict_threshold
+        annotations: Dict[str, Dict] = {}
+
+        all_mems = list(retrieved_mems.get("successed", [])) + list(retrieved_mems.get("failed", []))
+        for mem in all_mems:
+            mem_id = mem.get("memory_id", "")
+            meta = _meta_to_dict(mem.get("metadata", {}))
+
+            alpha = float(meta.get("belief_alpha", 1.0))
+            beta_val = float(meta.get("belief_beta", 1.0))
+            posterior_mean = alpha / (alpha + beta_val)
+            posterior_var = (alpha * beta_val) / ((alpha + beta_val) ** 2 * (alpha + beta_val + 1))
+            reuse = int(float(meta.get("belief_reuse", meta.get("n_reuse", 0))))
+            conflict = float(meta.get("belief_conflict", meta.get("n_conflict", 0)))
+            conflict_rate = conflict / (reuse + 1) if reuse >= 0 else 0.0
+            q_value = float(meta.get("q_value", 0.0))
+
+            is_uncertain = posterior_var > var_thr or conflict_rate > conf_thr
+
+            if is_uncertain:
+                reason = "high conflict" if conflict_rate > conf_thr else "low confidence"
+                label = f"{posterior_mean:.0%} success, {reason}, {reuse} uses"
+                confidence = "uncertain"
+            else:
+                label = f"{posterior_mean:.0%} success, {reuse} uses, Q={q_value:.2f}"
+                confidence = "confident"
+
+            sort_key = posterior_mean * 0.6 + max(q_value, 0.0) * 0.4
+            if is_uncertain:
+                sort_key -= 1.0  # push uncertain entries after confident ones
+
+            annotations[mem_id] = {
+                "confidence": confidence,
+                "label": label,
+                "sort_key": sort_key,
+            }
+
+        return annotations
+
+    # ------------------------------------------------------------------
     # State-first interface: compile retrieved memories into structured state
     # ------------------------------------------------------------------
 

@@ -256,10 +256,13 @@ class MempAgent(BaseAgent):
         state_prompt: str,
         task_type: str,
         raw_memories: dict = None,
+        belief_annotations: dict = None,
     ) -> List[Dict[str, str]]:
-        """
-        Build message list using compiled state as PRIMARY context.
-        Raw retrieved memories are included as truncated fallback evidence only.
+        """Build message list with belief-annotated memories (v2).
+
+        Single system message for memories (same structure as
+        ``_construct_messages``), but each memory is prefixed with a
+        one-line belief annotation and memories are sorted by confidence.
         """
         messages = [{"role": "system", "content": prompts.SYSTEM_PROMPT}]
 
@@ -269,27 +272,36 @@ class MempAgent(BaseAgent):
             example_dialogue[0]['content'] = "Here is an example of how to solve the task:\n" + example_dialogue[0]['content']
             messages.extend(example_dialogue)
 
-        # State-first context: compiled operating state
-        if state_prompt and state_prompt.strip():
-            state_context = (
-                "Below is your current operating state — a pre-processed summary of your "
-                "relevant memories, ranked by reliability and relevance. Use this as your "
-                "primary decision context:\n\n" + state_prompt
-            )
-            messages.append({"role": "system", "content": state_context})
-
-        # Raw memories as supporting evidence (full content for trajectory-heavy tasks)
+        # Build annotated memory context (single system message)
         if raw_memories:
+            annotations = belief_annotations or {}
             successful_mems = raw_memories.get('successed', [])
             failed_mems = raw_memories.get('failed', [])
 
-            memory_parts = []
+            def _sort_key(mem):
+                mid = mem.get("memory_id", "")
+                ann = annotations.get(mid)
+                return ann["sort_key"] if ann else 0.0
+
+            memory_parts = [
+                "In addition to the example, you have the following memories from your own past experiences. "
+                "Use them to help you if they are relevant:"
+            ]
+
             if successful_mems:
+                sorted_mems = sorted(successful_mems, key=_sort_key, reverse=True)
                 formatted = []
-                for mem in successful_mems:
+                for mem in sorted_mems:
                     content = self._format_retrieved_memory(mem.get('content', ''))
-                    if content:
-                        formatted.append(content)
+                    if not content:
+                        continue
+                    ann = annotations.get(mem.get("memory_id", ""))
+                    if ann:
+                        tag = "CONFIDENT" if ann["confidence"] == "confident" else "UNCERTAIN"
+                        prefix = f"[{tag}] {ann['label']}\n"
+                    else:
+                        prefix = ""
+                    formatted.append(prefix + content)
                 if formatted:
                     memory_parts.append(
                         "--- SUCCESSFUL MEMORIES (Examples to follow) ---\n" +
@@ -297,25 +309,28 @@ class MempAgent(BaseAgent):
                     )
 
             if failed_mems:
+                sorted_mems = sorted(failed_mems, key=_sort_key, reverse=True)
                 formatted = []
-                for mem in failed_mems:
+                for mem in sorted_mems:
                     content = self._format_retrieved_memory(mem.get('content', ''))
-                    if content:
-                        formatted.append(content)
+                    if not content:
+                        continue
+                    ann = annotations.get(mem.get("memory_id", ""))
+                    if ann:
+                        tag = "CONFIDENT" if ann["confidence"] == "confident" else "UNCERTAIN"
+                        prefix = f"[{tag}] {ann['label']}\n"
+                    else:
+                        prefix = ""
+                    formatted.append(prefix + content)
                 if formatted:
                     memory_parts.append(
                         "--- FAILED MEMORIES (Examples to avoid or learn from) ---\n" +
                         "\n".join(formatted)
                     )
 
-            if memory_parts:
-                fallback = (
-                    "Supporting evidence from past experiences "
-                    "(the operating state above summarizes reliability; "
-                    "details below for reference):\n\n" +
-                    "\n\n".join(memory_parts)
-                )
-                messages.append({"role": "system", "content": fallback})
+            if len(memory_parts) > 1:
+                memory_context = "\n\n".join(memory_parts)
+                messages.append({"role": "system", "content": memory_context})
 
         # Current task
         current_task_prompt = f"Now, it's your turn to solve a new task.\n{task_description}"

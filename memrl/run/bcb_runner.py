@@ -523,33 +523,30 @@ class BCBRunner:
                         for m in selected_mems
                         if isinstance(m, dict) and (m.get("memory_id") or m.get("id"))
                     ]
-                    # State-first: compile structured state view if available
-                    if self.state_first and hasattr(self.mem, "compile_state"):
+                    # State-first v2: annotate raw memory context with belief reliability
+                    mem_context = self._format_memory_context(selected_mems)
+                    if self.state_first and hasattr(self.mem, "annotate_memories"):
                         try:
-                            state = self.mem.compile_state(prompt, k=self.retrieve_k, threshold=thr)
-                            state_prompt = self.mem.format_state_prompt(state)
-                            if state_prompt and state_prompt.strip():
-                                mem_context = (
-                                    "Below is your current operating state — a pre-processed summary of "
-                                    "relevant memories, ranked by reliability and relevance. Use this as "
-                                    "your primary decision context:\n\n" + state_prompt
-                                )
-                            else:
-                                mem_context = self._format_memory_context(selected_mems)
+                            mems_dict = {"successed": selected_mems, "failed": []}
+                            annotations = self.mem.annotate_memories(mems_dict)
+                            if annotations:
+                                lines = ["[Memory Reliability]"]
+                                for idx, m in enumerate(selected_mems, 1):
+                                    ann = annotations.get(m.get("memory_id", ""))
+                                    if ann:
+                                        lines.append(f"  #{idx} ({ann['confidence']}): {ann['label']}")
+                                mem_context = "\n".join(lines) + "\n\n" + mem_context
                         except Exception:
-                            logger.debug("BCB state compilation failed, falling back to raw memories", exc_info=True)
-                            mem_context = self._format_memory_context(selected_mems)
-                    else:
-                        mem_context = self._format_memory_context(selected_mems)
+                            logger.debug("BCB belief annotation failed, using raw memories", exc_info=True)
                     try:
                         retrieval_trace = {
-                            "mode": "compile_state" if self.state_first else "retrieve_query",
+                            "mode": "annotate_memories" if self.state_first else "retrieve_query",
                             "retrieved_count": len(selected_ids),
                             "simmax": float((ret_result or {}).get("simmax", 0.0) or 0.0),
                         }
                     except Exception:
                         retrieval_trace = {
-                            "mode": "compile_state" if self.state_first else "retrieve_query",
+                            "mode": "annotate_memories" if self.state_first else "retrieve_query",
                             "retrieved_count": len(selected_ids),
                             "simmax": 0.0,
                         }

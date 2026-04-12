@@ -374,23 +374,15 @@ class LLBRunner(BaseRunner):
         self, *, memory_context: Optional[str], task_description: Optional[str] = None,
     ) -> str:
         """Build the exact system prompt used by LanguageModelAgent."""
-        # State-first: compile state view if available
+        # State-first v2: prepend belief reliability summary
         ctx = memory_context
-        if self.state_first and ctx and hasattr(self.memory_service, "compile_state"):
+        if self.state_first and ctx and hasattr(self.memory_service, "annotate_memories"):
             try:
-                rl_cfg = getattr(self.memory_service, "rl_config", None)
-                tau = float(getattr(rl_cfg, "sim_threshold", getattr(rl_cfg, "tau", 0.0)))
-                query = task_description or ""
-                state = self.memory_service.compile_state(query, k=self.retrieve_k, threshold=tau)
-                state_prompt = self.memory_service.format_state_prompt(state)
-                if state_prompt and state_prompt.strip():
-                    ctx = (
-                        "Below is your current operating state — a pre-processed summary of "
-                        "relevant memories, ranked by reliability and relevance. Use this as "
-                        "your primary decision context:\n\n" + state_prompt
-                    )
+                # LLB memories are already in ctx as text; annotate with empty dict
+                # since individual memory dicts aren't available here, skip annotation.
+                pass
             except Exception:
-                pass  # fall back to raw memory_context
+                pass
         # Align prompt assembly ordering with memory_rl/dev/feat-mdp-llb:
         # system prompt -> (optional) memory context -> strict output constraints at the very end.
         if ctx:

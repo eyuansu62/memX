@@ -813,19 +813,15 @@ class AlfworldRunner(BaseRunner):
 
         logger.info("Constructing initial ReAct prompts for each game...")
         for i in range(current_bs):
-            if self.state_first and hasattr(self.memory_service, "compile_state"):
-                # State-first: compile structured state and use as primary context
-                state = self.memory_service.compile_state(
-                    current_task_descs[i],
-                    k=self.retrieve_k,
-                    threshold=getattr(self.rl_config, "sim_threshold", 0.0),
-                )
-                state_prompt = self.memory_service.format_state_prompt(state)
+            if self.state_first and hasattr(self.memory_service, "annotate_memories"):
+                # State-first v2: single retrieval + inline belief annotations
+                annotations = self.memory_service.annotate_memories(retrieved_mems_per_slot[i])
                 messages_per_slot[i] = self.agent._construct_messages_state_first(
                     task_description=current_task_descs[i],
-                    state_prompt=state_prompt,
+                    state_prompt="",
                     task_type=task_types[i],
                     raw_memories=retrieved_mems_per_slot[i],
+                    belief_annotations=annotations,
                 )
             else:
                 messages_per_slot[i] = self.agent._construct_messages(

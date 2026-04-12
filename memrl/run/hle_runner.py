@@ -794,19 +794,20 @@ class HLERunner(BaseRunner):
                     ret_result, retrieved_topk_queries = ret, None
                 selected_mems = ret_result.get('selected', []) if ret_result else []
                 memory_ctx, retrieved_ids, memory_image_ids = self._build_memory_context(selected_mems, self.retrieve_k)
-                # State-first: replace raw memory context with compiled state view
-                if self.state_first and hasattr(self.memory_service, "compile_state"):
+                # State-first v2: prepend belief reliability summary to raw memory context
+                if self.state_first and hasattr(self.memory_service, "annotate_memories"):
                     try:
-                        state = self.memory_service.compile_state(q, k=self.retrieve_k, threshold=tau)
-                        state_prompt = self.memory_service.format_state_prompt(state)
-                        if state_prompt and state_prompt.strip():
-                            memory_ctx = (
-                                "Below is your current operating state — a pre-processed summary of "
-                                "relevant memories, ranked by reliability and relevance. Use this as "
-                                "your primary decision context:\n\n" + state_prompt
-                            )
+                        mems_dict = {"successed": selected_mems, "failed": []}
+                        annotations = self.memory_service.annotate_memories(mems_dict)
+                        if annotations:
+                            lines = ["[Memory Reliability]"]
+                            for idx, mem in enumerate(selected_mems, 1):
+                                ann = annotations.get(mem.get("memory_id", ""))
+                                if ann:
+                                    lines.append(f"  #{idx} ({ann['confidence']}): {ann['label']}")
+                            memory_ctx = "\n".join(lines) + "\n\n" + memory_ctx
                     except Exception as e:
-                        logger.warning("State compilation failed, falling back to raw memories: %s", e)
+                        logger.warning("Belief annotation failed, using raw memories: %s", e)
             except Exception as e:
                 logger.warning("Memory retrieval failed: %s", e)
 
