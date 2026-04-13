@@ -1131,6 +1131,219 @@ class BeliefMemoryService(MemoryService):
         return annotations
 
     # ------------------------------------------------------------------
+    # Compile-time resolve: LLM compiles memories into current state entries
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_memory_for_compiler(
+        mem: Dict,
+        index: int,
+        include_belief: bool = True,
+        format_fn=None,
+    ) -> str:
+        """Format a single memory for the compiler prompt.
+
+        Args:
+            mem: Memory dict with 'content', 'metadata', optionally 'memory_id'.
+            index: Display index.
+            include_belief: Whether to include belief metadata lines.
+            format_fn: Optional callable to clean raw content (e.g. agent's
+                ``_format_retrieved_memory``).  If *None*, raw content is used.
+        """
+        content = mem.get("content", "")
+        if format_fn:
+            content = format_fn(content) or content
+
+        meta = _meta_to_dict(mem.get("metadata", {}))
+        success = meta.get("success", meta.get("reward", ""))
+        label = "SUCCESS" if str(success) in ("1", "1.0", "True", "true") else "FAILURE"
+
+        lines = [f"[Memory {index}] ({label})"]
+
+        if include_belief:
+            alpha = float(meta.get("belief_alpha", 1.0))
+            beta_val = float(meta.get("belief_beta", 1.0))
+            posterior_mean = alpha / (alpha + beta_val)
+            reuse = int(float(meta.get("belief_reuse", meta.get("n_reuse", 0))))
+            conflict = float(meta.get("belief_conflict", meta.get("n_conflict", 0)))
+            conflict_rate = conflict / (reuse + 1) if reuse >= 0 else 0.0
+
+            # Discrete relevance bucket from Q-value (not raw float)
+            q = float(meta.get("q_value", 0.0))
+            relevance = "high" if q > 0.3 else ("medium" if q > -0.3 else "low")
+
+            lines.append(
+                f"  Confidence: {posterior_mean:.0%} success rate "
+                f"({reuse} uses, conflict rate: {conflict_rate:.0%})"
+            )
+            lines.append(f"  Relevance: {relevance}")
+
+        lines.append(f"  Content:\n{content}")
+        return "\n".join(lines)
+
+    def resolve_memories(
+        self,
+        retrieved_mems: Dict[str, list],
+        task_description: str,
+        llm,
+        include_belief: bool = True,
+        format_fn=None,
+    ) -> str:
+        """Compile retrieved memories into resolved current-state entries via LLM.
+
+        This is the core of **compile-time resolve**: instead of giving the
+        agent a list of memory entries to reason over, we ask an LLM to
+        resolve contradictions and produce concise state entries describing
+        what currently holds.
+
+        Args:
+            retrieved_mems: ``{"successed": [...], "failed": [...]}``.
+            task_description: Current task for context.
+            llm: An LLM provider with ``.generate(messages)`` method.
+            include_belief: If True, attach belief metadata to each memory
+                in the compiler prompt.  Set False for ablation.
+            format_fn: Optional content formatter (e.g. agent's
+                ``_format_retrieved_memory``).
+
+        Returns:
+            Rendered text of resolved state entries.
+        """
+        all_mems = (
+            list(retrieved_mems.get("successed", []))
+            + list(retrieved_mems.get("failed", []))
+        )
+        if not all_mems:
+            return ""
+
+        # Build memory descriptions for compiler
+        mem_blocks = []
+        for i, mem in enumerate(all_mems, 1):
+            block = self._format_memory_for_compiler(
+                mem, i, include_belief=include_belief, format_fn=format_fn,
+            )
+            mem_blocks.append(block)
+
+        memories_text = "\n\n".join(mem_blocks)
+
+        belief_instruction = ""
+        if include_belief:
+            belief_instruction = (
+                "\nIMPORTANT: Use CONFIDENCE (success rate) and CONFLICT signals "
+                "to decide which strategies currently hold. "
+                "Use RELEVANCE only as a secondary cue for importance, "
+                "NOT as evidence of truth.\n"
+            )
+
+        prompt = (
+            "You are a state compiler for a task-solving agent. "
+            "Given retrieved memories from past experiences on similar tasks, "
+            "compile them into a concise current-state view that the agent "
+            "can directly act on.\n"
+            f"{belief_instruction}\n"
+            "Output ONLY the compiled state in the following format:\n\n"
+            "## Current Best Strategies\n"
+            "(High-confidence approaches from successful experiences. "
+            "Be specific about actions and locations.)\n\n"
+            "## Known Pitfalls\n"
+            "(Confirmed failure patterns to avoid. Be specific.)\n\n"
+            "## Uncertain\n"
+            "(Strategies with conflicting or insufficient evidence. "
+            "Note what is unclear.)\n\n"
+            "Do NOT answer the task directly. Only compile what is known "
+            "from past experience.\n"
+            "Keep each entry concise (1-2 sentences).\n"
+            "If memories conflict, resolve in favor of higher confidence.\n\n"
+            f"Current task: {task_description}\n\n"
+            f"Retrieved memories:\n{memories_text}"
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a precise state compiler."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            result = llm.generate(messages)
+            return result.strip() if result else ""
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "resolve_memories LLM call failed: %s; falling back to empty", e
+            )
+            return ""
+
+    def generic_summary(
+        self,
+        retrieved_mems: Dict[str, list],
+        task_description: str,
+        llm,
+        include_belief: bool = False,
+        format_fn=None,
+    ) -> str:
+        """Summarize retrieved memories via LLM (control baseline for ablation).
+
+        Same input pipeline as ``resolve_memories`` but uses a generic
+        summarization prompt without state-resolve semantics.  The output
+        uses the **same section headers** as resolve for matched comparison.
+
+        Args:
+            retrieved_mems: ``{"successed": [...], "failed": [...]}``.
+            task_description: Current task for context.
+            llm: LLM provider.
+            include_belief: If True, include belief metadata (for
+                summary+belief ablation).
+            format_fn: Optional content formatter.
+
+        Returns:
+            Rendered summary text.
+        """
+        all_mems = (
+            list(retrieved_mems.get("successed", []))
+            + list(retrieved_mems.get("failed", []))
+        )
+        if not all_mems:
+            return ""
+
+        mem_blocks = []
+        for i, mem in enumerate(all_mems, 1):
+            block = self._format_memory_for_compiler(
+                mem, i, include_belief=include_belief, format_fn=format_fn,
+            )
+            mem_blocks.append(block)
+
+        memories_text = "\n\n".join(mem_blocks)
+
+        prompt = (
+            "You are a helpful assistant. Summarize the following past "
+            "experiences into key takeaways for solving the current task.\n\n"
+            "Organize your summary into these sections:\n\n"
+            "## Useful Strategies\n"
+            "(What approaches worked well)\n\n"
+            "## Potential Pitfalls\n"
+            "(What to watch out for)\n\n"
+            "## Open Questions\n"
+            "(Anything unclear or inconsistent)\n\n"
+            "Keep each point concise (1-2 sentences).\n\n"
+            f"Current task: {task_description}\n\n"
+            f"Past experiences:\n{memories_text}"
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            result = llm.generate(messages)
+            return result.strip() if result else ""
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "generic_summary LLM call failed: %s; falling back to empty", e
+            )
+            return ""
+
+    # ------------------------------------------------------------------
     # State-first interface: compile retrieved memories into structured state
     # ------------------------------------------------------------------
 

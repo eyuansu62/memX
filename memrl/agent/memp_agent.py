@@ -337,6 +337,41 @@ class MempAgent(BaseAgent):
         messages.append({"role": "user", "content": current_task_prompt})
         return messages
 
+    def _construct_messages_resolved(
+        self,
+        task_description: str,
+        compiled_state: str,
+        task_type: str,
+    ) -> List[Dict[str, str]]:
+        """Build message list with LLM-compiled state view.
+
+        The agent reads resolved state entries (current strategies, pitfalls,
+        uncertainties) instead of a list of raw memory entries.  This is the
+        core of the state-first interface: the agent reads *what currently
+        holds*, not a memory archive.
+        """
+        messages = [{"role": "system", "content": prompts.SYSTEM_PROMPT}]
+
+        # Few-shot example
+        example_dialogue = self._get_examples_for_task(task_type)
+        if example_dialogue:
+            example_dialogue[0]['content'] = "Here is an example of how to solve the task:\n" + example_dialogue[0]['content']
+            messages.extend(example_dialogue)
+
+        # Compiled state as memory context (single system message)
+        if compiled_state and compiled_state.strip():
+            memory_context = (
+                "Based on your past experiences, here is what is currently known "
+                "about tasks like this. Use this to guide your actions:\n\n"
+                + compiled_state
+            )
+            messages.append({"role": "system", "content": memory_context})
+
+        # Current task
+        current_task_prompt = f"Now, it's your turn to solve a new task.\n{task_description}"
+        messages.append({"role": "user", "content": current_task_prompt})
+        return messages
+
     def _parse_action(self, llm_response: str) -> str:
         """
         Extracts the 'Action:' part from the ReAct response.

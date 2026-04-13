@@ -63,7 +63,10 @@ class AlfworldRunner(BaseRunner):
                  ckpt_resume_enabled: bool = False, ckpt_resume_path: Optional[str] = None, ckpt_resume_epoch: Optional[int] = None,
                  baseline_mode: Optional[str] = None, baseline_k: int = 10,
                  llm_judge: Optional[ALFWorldJudge] = None, llm_judge_alpha: float = 0.3,
-                 state_first: bool = False):
+                 state_first: bool = False,
+                 compile_mode: str = "off",
+                 compiler_use_belief: bool = True,
+                 compiler_llm=None):
         self.agent = agent
         self.root = root
         self.memory_service = memory_service
@@ -89,6 +92,11 @@ class AlfworldRunner(BaseRunner):
         self.llm_judge: Optional[ALFWorldJudge] = llm_judge
         self.llm_judge_alpha: float = float(llm_judge_alpha)
         self.state_first: bool = bool(state_first)
+
+        # Compile-time resolve settings
+        self.compile_mode: str = compile_mode.strip().lower() if compile_mode else "off"
+        self.compiler_use_belief: bool = compiler_use_belief
+        self.compiler_llm = compiler_llm  # None → use self.agent.llm
 
         self.rl_config: Optional[RLConfig] = rl_config
 
@@ -812,9 +820,38 @@ class AlfworldRunner(BaseRunner):
         retrieved_mems_per_slot = self.process_retrieve_mems(retrieved_mems_per_slot)
 
         logger.info("Constructing initial ReAct prompts for each game...")
+        _compiler = self.compiler_llm or self.agent.llm
         for i in range(current_bs):
-            if self.state_first and hasattr(self.memory_service, "annotate_memories"):
-                # State-first v2: single retrieval + inline belief annotations
+            if self.compile_mode == "resolve" and hasattr(self.memory_service, "resolve_memories"):
+                # Compile-time resolve: LLM compiles memories into state entries
+                compiled = self.memory_service.resolve_memories(
+                    retrieved_mems_per_slot[i],
+                    current_task_descs[i],
+                    _compiler,
+                    include_belief=self.compiler_use_belief,
+                    format_fn=self.agent._format_retrieved_memory,
+                )
+                messages_per_slot[i] = self.agent._construct_messages_resolved(
+                    task_description=current_task_descs[i],
+                    compiled_state=compiled,
+                    task_type=task_types[i],
+                )
+            elif self.compile_mode == "summary" and hasattr(self.memory_service, "generic_summary"):
+                # Generic summary control (for ablation)
+                compiled = self.memory_service.generic_summary(
+                    retrieved_mems_per_slot[i],
+                    current_task_descs[i],
+                    _compiler,
+                    include_belief=self.compiler_use_belief,
+                    format_fn=self.agent._format_retrieved_memory,
+                )
+                messages_per_slot[i] = self.agent._construct_messages_resolved(
+                    task_description=current_task_descs[i],
+                    compiled_state=compiled,
+                    task_type=task_types[i],
+                )
+            elif self.compile_mode == "annotate" and hasattr(self.memory_service, "annotate_memories"):
+                # State-first v2: belief annotations on raw memories
                 annotations = self.memory_service.annotate_memories(retrieved_mems_per_slot[i])
                 messages_per_slot[i] = self.agent._construct_messages_state_first(
                     task_description=current_task_descs[i],
@@ -824,6 +861,7 @@ class AlfworldRunner(BaseRunner):
                     belief_annotations=annotations,
                 )
             else:
+                # Default: raw memory list
                 messages_per_slot[i] = self.agent._construct_messages(
                     task_description=current_task_descs[i],
                     retrieved_memories=retrieved_mems_per_slot[i],

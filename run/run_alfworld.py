@@ -218,6 +218,22 @@ def main():
                 ckpt_resume_path = str(ckpt_path)
             logger.info("Inference mode: loading checkpoint from %s (epoch=%s)", ckpt_resume_path, ckpt_resume_epoch)
 
+        # Build compiler LLM (for resolve/summary modes)
+        compiler_llm = None
+        compiler_cfg = getattr(cfg, "compiler", None)
+        if compiler_cfg and not getattr(compiler_cfg, "use_actor_model", True):
+            compiler_llm = OpenAILLM(
+                api_key=compiler_cfg.api_key,
+                base_url=compiler_cfg.base_url,
+                model=compiler_cfg.model,
+                default_temperature=compiler_cfg.temperature,
+                default_max_tokens=compiler_cfg.max_tokens,
+                token_log_dir=str(log_dir),
+            )
+            logger.info("Using separate compiler LLM: %s @ %s", compiler_cfg.model, compiler_cfg.base_url)
+        else:
+            logger.info("Compiler will reuse actor LLM")
+
         alfworld_config_path = project_root / "configs" / "envs" / "alfworld.yaml"
         runner = AlfworldRunner(
             agent=agent,
@@ -245,6 +261,9 @@ def main():
             llm_judge=llm_judge,
             llm_judge_alpha=getattr(cfg.experiment, "llm_judge_alpha", 0.3),
             state_first=getattr(cfg.experiment, "state_first", False),
+            compile_mode=getattr(cfg.experiment, "compile_mode", "off"),
+            compiler_use_belief=getattr(cfg.experiment, "compiler_use_belief", True),
+            compiler_llm=compiler_llm,
         )
         runner.run()
 

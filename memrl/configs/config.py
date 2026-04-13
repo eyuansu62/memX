@@ -214,6 +214,23 @@ class ExperimentConfig(BaseModel):
     # State-first execution
     state_first: bool = Field(default=False, description="Use state-first agent interface (compiled state as primary context)")
 
+    # Compile mode: controls how retrieved memories are presented to the agent.
+    #   off      — raw memory list (standard path)
+    #   annotate — belief-annotated memory list (v2, no extra LLM call)
+    #   summary  — LLM generic summary of memories (control baseline)
+    #   resolve  — LLM state-resolve: compile memories into current state entries
+    compile_mode: str = Field(
+        default="off",
+        description="Compile strategy: off | annotate | summary | resolve",
+    )
+    # Whether the compiler receives belief metadata (confidence, conflict, reuse).
+    # When False, compiler only sees memory content + success/failure label.
+    # Useful for ablation: summary+belief vs summary-only, resolve+belief vs resolve-only.
+    compiler_use_belief: bool = Field(
+        default=True,
+        description="Pass belief metadata to compiler (for ablation)",
+    )
+
     # Output settings
     output_dir: str = Field(default="./results", description="Directory for experiment outputs")
     save_trajectories: bool = Field(default=True, description="Save detailed trajectories")
@@ -222,6 +239,26 @@ class ExperimentConfig(BaseModel):
     # Logging settings
     enable_logging: bool = Field(default=True, description="Enable detailed logging")
     log_level: str = Field(default="INFO", description="Logging level")
+
+class CompilerLLMConfig(BaseModel):
+    """Configuration for the state compiler LLM (used in resolve/summary modes).
+
+    When ``use_actor_model`` is True (default), the compiler reuses the main
+    LLM provider.  Set to False and fill in the remaining fields to use a
+    separate, potentially stronger model for compilation.
+    """
+
+    use_actor_model: bool = Field(
+        default=True,
+        description="If True, reuse the actor LLM for compilation",
+    )
+    provider: str = Field(default="openai", description="Compiler LLM provider")
+    api_key: str = Field(default="sk-8", description="API key")
+    base_url: Optional[str] = Field(default="http://localhost:8000/v1", description="Base URL")
+    model: str = Field(default="", description="Compiler model name (empty = same as actor)")
+    temperature: float = Field(default=0.3, ge=0, le=2, description="Lower temp for more deterministic compilation")
+    max_tokens: Optional[int] = Field(default=1024, gt=0, description="Max tokens for compiled output")
+
 
 class RLConfig(BaseModel):
     """Configuration for reinforcement learning parameters."""
@@ -323,6 +360,7 @@ class MempConfig(BaseModel):
     experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
     rl_config: RLConfig = Field(default_factory=RLConfig)
     belief: BeliefConfigModel = Field(default_factory=BeliefConfigModel)
+    compiler: CompilerLLMConfig = Field(default_factory=CompilerLLMConfig)
     # Global settings
     project_name: str = Field(default="memp", description="Project name")
     version: str = Field(default="0.1.0", description="Project version")
