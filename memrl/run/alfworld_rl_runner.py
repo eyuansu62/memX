@@ -821,52 +821,91 @@ class AlfworldRunner(BaseRunner):
 
         logger.info("Constructing initial ReAct prompts for each game...")
         _compiler = self.compiler_llm or self.agent.llm
-        for i in range(current_bs):
-            if self.compile_mode == "resolve" and hasattr(self.memory_service, "resolve_memories"):
-                # Compile-time resolve: LLM compiles memories into state entries
-                compiled = self.memory_service.resolve_memories(
-                    retrieved_mems_per_slot[i],
-                    current_task_descs[i],
-                    _compiler,
-                    include_belief=self.compiler_use_belief,
-                    format_fn=self.agent._format_retrieved_memory,
-                )
-                messages_per_slot[i] = self.agent._construct_messages_resolved(
-                    task_description=current_task_descs[i],
-                    compiled_state=compiled,
-                    task_type=task_types[i],
-                )
-            elif self.compile_mode == "summary" and hasattr(self.memory_service, "generic_summary"):
-                # Generic summary control (for ablation)
-                compiled = self.memory_service.generic_summary(
-                    retrieved_mems_per_slot[i],
-                    current_task_descs[i],
-                    _compiler,
-                    include_belief=self.compiler_use_belief,
-                    format_fn=self.agent._format_retrieved_memory,
-                )
-                messages_per_slot[i] = self.agent._construct_messages_resolved(
-                    task_description=current_task_descs[i],
-                    compiled_state=compiled,
-                    task_type=task_types[i],
-                )
-            elif self.compile_mode == "annotate" and hasattr(self.memory_service, "annotate_memories"):
-                # State-first v2: belief annotations on raw memories
-                annotations = self.memory_service.annotate_memories(retrieved_mems_per_slot[i])
-                messages_per_slot[i] = self.agent._construct_messages_state_first(
-                    task_description=current_task_descs[i],
-                    state_prompt="",
-                    task_type=task_types[i],
-                    raw_memories=retrieved_mems_per_slot[i],
-                    belief_annotations=annotations,
-                )
-            else:
-                # Default: raw memory list
-                messages_per_slot[i] = self.agent._construct_messages(
-                    task_description=current_task_descs[i],
-                    retrieved_memories=retrieved_mems_per_slot[i],
-                    task_type=task_types[i]
-                )
+
+        # Parallel compile for resolve/summary modes (each slot makes an LLM call)
+        if self.compile_mode in ("resolve", "summary") and current_bs > 1:
+            _has_resolve = hasattr(self.memory_service, "resolve_memories")
+            _has_summary = hasattr(self.memory_service, "generic_summary")
+
+            def _compile_slot(i):
+                if self.compile_mode == "resolve" and _has_resolve:
+                    return self.memory_service.resolve_memories(
+                        retrieved_mems_per_slot[i],
+                        current_task_descs[i],
+                        _compiler,
+                        include_belief=self.compiler_use_belief,
+                        format_fn=self.agent._format_retrieved_memory,
+                    )
+                elif self.compile_mode == "summary" and _has_summary:
+                    return self.memory_service.generic_summary(
+                        retrieved_mems_per_slot[i],
+                        current_task_descs[i],
+                        _compiler,
+                        include_belief=self.compiler_use_belief,
+                        format_fn=self.agent._format_retrieved_memory,
+                    )
+                return None
+
+            with ThreadPoolExecutor(max_workers=current_bs) as executor:
+                compiled_results = list(executor.map(_compile_slot, range(current_bs)))
+
+            for i in range(current_bs):
+                if compiled_results[i] is not None:
+                    messages_per_slot[i] = self.agent._construct_messages_resolved(
+                        task_description=current_task_descs[i],
+                        compiled_state=compiled_results[i],
+                        task_type=task_types[i],
+                    )
+                else:
+                    messages_per_slot[i] = self.agent._construct_messages(
+                        task_description=current_task_descs[i],
+                        retrieved_memories=retrieved_mems_per_slot[i],
+                        task_type=task_types[i]
+                    )
+        else:
+            # Serial path for annotate/default or single-slot batches
+            for i in range(current_bs):
+                if self.compile_mode == "resolve" and hasattr(self.memory_service, "resolve_memories"):
+                    compiled = self.memory_service.resolve_memories(
+                        retrieved_mems_per_slot[i],
+                        current_task_descs[i],
+                        _compiler,
+                        include_belief=self.compiler_use_belief,
+                        format_fn=self.agent._format_retrieved_memory,
+                    )
+                    messages_per_slot[i] = self.agent._construct_messages_resolved(
+                        task_description=current_task_descs[i],
+                        compiled_state=compiled,
+                        task_type=task_types[i],
+                    )
+                elif self.compile_mode == "summary" and hasattr(self.memory_service, "generic_summary"):
+                    compiled = self.memory_service.generic_summary(
+                        retrieved_mems_per_slot[i],
+                        current_task_descs[i],
+                        _compiler,
+                        include_belief=self.compiler_use_belief,
+                        format_fn=self.agent._format_retrieved_memory,
+                    )
+                    messages_per_slot[i] = self.agent._construct_messages_resolved(
+                        task_description=current_task_descs[i],
+                        compiled_state=compiled,
+                        task_type=task_types[i],
+                    )
+                elif self.compile_mode == "annotate" and hasattr(self.memory_service, "annotate_memories"):
+                    annotations = self.memory_service.annotate_memories(retrieved_mems_per_slot[i])
+                    messages_per_slot[i] = self.agent._construct_messages_state_first(
+                        task_description=current_task_descs[i],
+                        state_prompt="",
+                        task_type=task_types[i],
+                        raw_memories=retrieved_mems_per_slot[i],
+                        belief_annotations=annotations,
+                    )
+                else:
+                    messages_per_slot[i] = self.agent._construct_messages(
+                        task_description=current_task_descs[i],
+                        retrieved_memories=retrieved_mems_per_slot[i],
+                        task_type=task_types[i]
+                    )
 
         for step in tqdm(range(self.max_steps), desc="Sampling mini-batch (ReAct)"):
             if not messages_per_slot: # Break if all tasks are somehow finished
@@ -1112,9 +1151,16 @@ class AlfworldRunner(BaseRunner):
                 _ev_log.set_epoch(section_num)
 
             section_trajectories = []
+            _pending_update_future = None
+            _bg_executor = ThreadPoolExecutor(max_workers=1)
 
             # --- Inner Loop: Iterate through mini-batches (environments) ---
             for i, mini_batch_games in tqdm(enumerate(section_data)):
+                # Wait for previous batch's memory update before starting new one
+                if _pending_update_future is not None:
+                    _pending_update_future.result()
+                    _pending_update_future = None
+
                 logger.info(f"Processing mini-batch {i+1}/{len(section_data)} in section {section_num}...")
 
                 # Collect trajectories
@@ -1132,9 +1178,9 @@ class AlfworldRunner(BaseRunner):
                 logger.info(f"Mini-batch {i+1} collected {len(collected_trajs)} trajectories.")
                 section_trajectories.extend(collected_trajs)
 
-                # --- Memory Processing for this mini-batch ---
+                # --- Prepare memory update payload (lightweight, no I/O) ---
                 task_descriptions = [traj["task_description"] for traj in collected_trajs]
-                trajectories = [traj['trajectory'] for traj in collected_trajs]
+                trajectories_for_update = [traj['trajectory'] for traj in collected_trajs]
                 successes = [traj["success"] for traj in collected_trajs]
 
                 retrieved_ids_list = [
@@ -1149,13 +1195,13 @@ class AlfworldRunner(BaseRunner):
 
                 retrieved_queries = [traj["retrieved_queries"] for traj in collected_trajs]
 
-                # --- LLM-as-judge reward blending ---
+                # --- LLM-as-judge reward blending (must run before Q-update) ---
                 blended_rewards: Optional[list] = None
                 if self.llm_judge is not None:
                     logger.info(f"Running LLM judge on {len(collected_trajs)} trajectories...")
                     judge_results = self.llm_judge.judge_batch(
                         tasks=task_descriptions,
-                        trajectories=trajectories,
+                        trajectories=trajectories_for_update,
                         env_successes=successes,
                         max_workers=min(8, len(collected_trajs)),
                     )
@@ -1178,12 +1224,13 @@ class AlfworldRunner(BaseRunner):
                         sum(blended_rewards) / len(blended_rewards),
                     )
 
-                # update q value for retrieved mems
+                # Q-value update must happen synchronously (affects next batch retrieval ranking)
                 updated_q_list = self.memory_service.update_values(
                     successes, retrieved_ids_list, rewards=blended_rewards
                 )
                 logger.info(f"Updated Q-values for mini-batch {i+1}: {updated_q_list}")
 
+                # --- Pipeline: add_memories + divergence refine in background ---
                 metadatas_update = [
                     {
                         "source_benchmark": "alfworld_build",
@@ -1197,27 +1244,49 @@ class AlfworldRunner(BaseRunner):
                     for traj in collected_trajs
                 ]
 
-                self.memory_service.add_memories(
-                    task_descriptions=task_descriptions,
-                    trajectories=trajectories,
-                    successes=successes,
-                    retrieved_memory_queries=retrieved_queries,
-                    retrieved_memory_ids_list=retrieved_ids_list,
-                    metadatas=metadatas_update
-                )
+                def _bg_memory_update(
+                    _td=task_descriptions,
+                    _traj=trajectories_for_update,
+                    _succ=successes,
+                    _rq=retrieved_queries,
+                    _rid=retrieved_ids_list,
+                    _meta=metadatas_update,
+                    _batch_num=i+1,
+                ):
+                    try:
+                        self.memory_service.add_memories(
+                            task_descriptions=_td,
+                            trajectories=_traj,
+                            successes=_succ,
+                            retrieved_memory_queries=_rq,
+                            retrieved_memory_ids_list=_rid,
+                            metadatas=_meta,
+                        )
+                    except Exception:
+                        logger.error("Background add_memories failed for mini-batch %d", _batch_num, exc_info=True)
 
-                # Check for successful divergence and auto-refine
-                if hasattr(self.memory_service, "check_divergence_and_refine"):
-                    n_refined = self.memory_service.check_divergence_and_refine(
-                        task_descriptions=task_descriptions,
-                        trajectories=trajectories,
-                        successes=successes,
-                        retrieved_ids_list=retrieved_ids_list,
-                    )
-                    if n_refined > 0:
-                        logger.info(f"Divergence-triggered refine: {n_refined} memories rewritten")
+                    if hasattr(self.memory_service, "check_divergence_and_refine"):
+                        try:
+                            n_refined = self.memory_service.check_divergence_and_refine(
+                                task_descriptions=_td,
+                                trajectories=_traj,
+                                successes=_succ,
+                                retrieved_ids_list=_rid,
+                            )
+                            if n_refined > 0:
+                                logger.info(f"Divergence-triggered refine: {n_refined} memories rewritten")
+                        except Exception:
+                            logger.error("Background divergence refine failed for mini-batch %d", _batch_num, exc_info=True)
 
-                logger.info(f"Mini-batch {i+1} memory update complete.")
+                    logger.info(f"Mini-batch {_batch_num} memory update complete.")
+
+                _pending_update_future = _bg_executor.submit(_bg_memory_update)
+
+            # Drain any pending update before section ends
+            if _pending_update_future is not None:
+                _pending_update_future.result()
+                _pending_update_future = None
+            _bg_executor.shutdown(wait=False)
 
             logger.info(f"Section {section_num} complete. Total {len(section_trajectories)} trajectories collected.")
 
