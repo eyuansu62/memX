@@ -531,8 +531,9 @@ class BCBRunner:
 
         # ── Batched parallel execution ────────────────────────────────
         BATCH = 25
-        eval_workers = min(8, os.cpu_count() or 4)
-        gen_workers = min(16, BATCH)
+        _cpus = os.cpu_count() or 4
+        eval_workers = min(BATCH, max(4, _cpus // 4))
+        gen_workers = min(BATCH, max(4, _cpus // 4))
 
         for batch_start in range(0, total, BATCH):
             batch_ids = task_ids[batch_start : batch_start + BATCH]
