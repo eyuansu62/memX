@@ -13,24 +13,19 @@
 
 llm:
   provider: "openai"
-  # NOTE: do not commit real keys/endpoints in this file.
-  # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  api_version: null
-  model: "gpt-4o-mini"
+  api_key: "local"
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
   temperature: 0.0
   max_tokens: 12800
 
 embedding:
   provider: "openai"
-  # NOTE: do not commit real keys/endpoints in this file.
-  # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
-  api_key: "sk-REPLACE_ME"
-  base_url: "https://api.openai.com/v1"
-  api_version: null
-  model: "text-embedding-3-large"
-  max_text_len: 8196
+  api_key: "local"
+  base_url: "http://localhost:8001/v1"
+  model: "Qwen3-Embedding-4B"
+  max_text_len: 4096
+  vector_dimension: 2560
 
 memory:
   # Strategies (keep consistent with the other MemRL benchmarks in this repo)
