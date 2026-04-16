@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,54 @@ from memrl.bigcodebench_eval.eval_utils import (
 from memrl.bigcodebench_eval.task_wrappers import get_prompt, load_bcb_data, split_dataset, write_samples
 
 logger = logging.getLogger(__name__)
+
+# ── Standalone helpers for parallel execution (must be picklable) ─────────────
+
+def _evaluate_one_standalone(
+    task_id: str,
+    entry_point: str,
+    test_code: str,
+    code: str,
+    eval_timeout_s: float,
+    hard_timeout_s: float,
+    bcb_repo: Optional[str],
+) -> Dict[str, Any]:
+    """Evaluate a single BCB solution in a separate process."""
+    if not test_code:
+        return {"task_id": task_id, "status": "SYNTAX_OK", "error": "no_test_code"}
+    try:
+        compile(code, "<string>", "exec")
+    except SyntaxError as e:
+        return {"task_id": task_id, "status": "SYNTAX_ERROR", "error": str(e)}
+
+    clean_code = sanitize_code(code, entry_point, bcb_repo=bcb_repo)
+
+    from bigcodebench.eval import PASS, FAIL, TIMEOUT  # type: ignore
+
+    stat, details, err, hard_timed_out = run_untrusted_check_with_hard_timeout(
+        code=clean_code,
+        test_code=test_code,
+        entry_point=entry_point,
+        max_as_limit=30 * 1024,
+        max_data_limit=30 * 1024,
+        max_stack_limit=10,
+        min_time_limit=1.0,
+        gt_time_limit=float(eval_timeout_s),
+        hard_timeout_s=float(hard_timeout_s),
+        bcb_repo=bcb_repo,
+    )
+
+    if hard_timed_out:
+        return {"task_id": task_id, "status": "TIMEOUT", "error": err or "hard_timeout"}
+    if err:
+        return {"task_id": task_id, "status": "RUNTIME_ERROR", "error": err}
+    if stat == PASS:
+        return {"task_id": task_id, "status": "PASS"}
+    if stat == TIMEOUT:
+        return {"task_id": task_id, "status": "TIMEOUT", "error": "timeout"}
+    if stat == FAIL:
+        return {"task_id": task_id, "status": "FAIL", "error": str(details)[:500] if details else "fail"}
+    return {"task_id": task_id, "status": "UNKNOWN", "error": str(stat)}
 
 try:
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
@@ -497,172 +546,207 @@ class BCBRunner:
                 pending_retrieved_queries.clear()
                 pending_metadatas.clear()
 
-        for idx, task_id in enumerate(task_ids, start=1):
-            task = self._problems[task_id]
-            prompt = get_prompt(task, split=self.sel.split)
-            selected_ids: List[str] = []
-            retrieved_topk_queries: Optional[List[Tuple[str, float]]] = None
-            mem_context = ""
-            retrieval_trace: Dict[str, Any] = {}
+        # ── Batched parallel execution ────────────────────────────────
+        # Process tasks in chunks: retrieve → generate (ThreadPool) → eval (ThreadPool) → flush.
+        # NOTE: eval uses ThreadPool (not ProcessPool) because run_untrusted_check_with_hard_timeout
+        # already spawns a subprocess internally — nesting ProcessPool causes deadlocks.
+        BATCH = 25
+        eval_workers = min(8, os.cpu_count() or 4)
+        gen_workers = min(16, BATCH)
 
-            if self.mem is not None and self.retrieve_k > 0:
-                try:
-                    thr = self._get_retrieve_threshold()
-                    ret = self.mem.retrieve_query(prompt, k=self.retrieve_k, threshold=thr)
-                    if isinstance(ret, tuple):
-                        ret_result, retrieved_topk_queries = ret
-                    else:
-                        ret_result, retrieved_topk_queries = ret, None
+        for batch_start in range(0, total, BATCH):
+            batch_ids = task_ids[batch_start : batch_start + BATCH]
+            batch_len = len(batch_ids)
 
-                    selected_mems = (ret_result or {}).get("selected", []) if ret_result else []
-                    if not isinstance(selected_mems, list):
-                        selected_mems = []
+            # --- 1. Prepare prompts & retrieve memories (serial, fast) ---
+            batch_prompts: List[str] = []
+            batch_mem_contexts: List[str] = []
+            batch_selected_ids: List[List[str]] = []
+            batch_topk_queries: List[Optional[List[Tuple[str, float]]]] = []
+            batch_retrieval_traces: List[Dict[str, Any]] = []
 
-                    selected_ids = [
-                        str(m.get("memory_id") or m.get("id"))
-                        for m in selected_mems
-                        if isinstance(m, dict) and (m.get("memory_id") or m.get("id"))
-                    ]
-                    # State-first v2: annotate raw memory context with belief reliability
-                    mem_context = self._format_memory_context(selected_mems)
-                    if self.state_first and hasattr(self.mem, "annotate_memories"):
-                        try:
-                            mems_dict = {"successed": selected_mems, "failed": []}
-                            annotations = self.mem.annotate_memories(mems_dict)
-                            if annotations:
-                                lines = ["[Memory Reliability]"]
-                                for idx, m in enumerate(selected_mems, 1):
-                                    ann = annotations.get(m.get("memory_id", ""))
-                                    if ann:
-                                        lines.append(f"  #{idx} ({ann['confidence']}): {ann['label']}")
-                                mem_context = "\n".join(lines) + "\n\n" + mem_context
-                        except Exception:
-                            logger.debug("BCB belief annotation failed, using raw memories", exc_info=True)
+            for task_id in batch_ids:
+                task = self._problems[task_id]
+                prompt = get_prompt(task, split=self.sel.split)
+                batch_prompts.append(prompt)
+
+                sel_ids: List[str] = []
+                topk_q: Optional[List[Tuple[str, float]]] = None
+                mem_ctx = ""
+                r_trace: Dict[str, Any] = {}
+
+                if self.mem is not None and self.retrieve_k > 0:
                     try:
-                        retrieval_trace = {
-                            "mode": "annotate_memories" if self.state_first else "retrieve_query",
-                            "retrieved_count": len(selected_ids),
-                            "simmax": float((ret_result or {}).get("simmax", 0.0) or 0.0),
-                        }
+                        thr = self._get_retrieve_threshold()
+                        ret = self.mem.retrieve_query(prompt, k=self.retrieve_k, threshold=thr)
+                        if isinstance(ret, tuple):
+                            ret_result, topk_q = ret
+                        else:
+                            ret_result, topk_q = ret, None
+                        selected_mems = (ret_result or {}).get("selected", []) if ret_result else []
+                        if not isinstance(selected_mems, list):
+                            selected_mems = []
+                        sel_ids = [
+                            str(m.get("memory_id") or m.get("id"))
+                            for m in selected_mems
+                            if isinstance(m, dict) and (m.get("memory_id") or m.get("id"))
+                        ]
+                        mem_ctx = self._format_memory_context(selected_mems)
+                        if self.state_first and hasattr(self.mem, "annotate_memories"):
+                            try:
+                                mems_dict = {"successed": selected_mems, "failed": []}
+                                annotations = self.mem.annotate_memories(mems_dict)
+                                if annotations:
+                                    lines = ["[Memory Reliability]"]
+                                    for mi, m in enumerate(selected_mems, 1):
+                                        ann = annotations.get(m.get("memory_id", ""))
+                                        if ann:
+                                            lines.append(f"  #{mi} ({ann['confidence']}): {ann['label']}")
+                                    mem_ctx = "\n".join(lines) + "\n\n" + mem_ctx
+                            except Exception:
+                                pass
+                        try:
+                            r_trace = {
+                                "mode": "annotate_memories" if self.state_first else "retrieve_query",
+                                "retrieved_count": len(sel_ids),
+                                "simmax": float((ret_result or {}).get("simmax", 0.0) or 0.0),
+                            }
+                        except Exception:
+                            r_trace = {"mode": "retrieve_query", "retrieved_count": len(sel_ids), "simmax": 0.0}
                     except Exception:
-                        retrieval_trace = {
-                            "mode": "annotate_memories" if self.state_first else "retrieve_query",
-                            "retrieved_count": len(selected_ids),
-                            "simmax": 0.0,
-                        }
-                except Exception:
-                    logger.debug("BCB retrieval failed for %s", task_id, exc_info=True)
+                        logger.debug("BCB retrieval failed for %s", task_id, exc_info=True)
 
-            # Update TensorBoard aggregations (best-effort; reset in progress block).
-            if self.retrieve_k > 0:
-                tb_window_tasks += 1
-                tb_retrieved_sum += int(len(selected_ids))
-                try:
-                    tb_simmax_sum += float(retrieval_trace.get("simmax", 0.0) or 0.0)
-                except Exception:
-                    pass
+                batch_mem_contexts.append(mem_ctx)
+                batch_selected_ids.append(sel_ids)
+                batch_topk_queries.append(topk_q)
+                batch_retrieval_traces.append(r_trace)
 
-            raw_response = self._generate_raw(prompt, memory_context=mem_context)
-            code = extract_code_from_response(raw_response)
+            # --- 2. Generate code in parallel (ThreadPool → vLLM) ---
+            batch_raw_responses: List[str] = [""] * batch_len
+            batch_codes: List[str] = [""] * batch_len
 
-            retrieval_logs.append(
-                {
-                    "task_id": task_id,
-                    "epoch": epoch,
-                    "phase": phase,
-                    "selected_ids": selected_ids,
-                    "retrieved_topk_queries": retrieved_topk_queries,
-                    "threshold": self._get_retrieve_threshold(),
-                }
-            )
+            def _gen_one(i: int) -> Tuple[int, str, str]:
+                raw = self._generate_raw(batch_prompts[i], memory_context=batch_mem_contexts[i])
+                return i, raw, extract_code_from_response(raw)
 
-            eval_res = self._evaluate_one(task=task, code=code)
-            ok = eval_res.get("status") == "PASS"
-            pass_count += 1 if ok else 0
+            with ThreadPoolExecutor(max_workers=gen_workers) as gen_pool:
+                for i, raw, code in gen_pool.map(lambda idx: _gen_one(idx), range(batch_len)):
+                    batch_raw_responses[i] = raw
+                    batch_codes[i] = code
 
-            sample = {
-                "task_id": task_id,
-                "solution": code,
-                "prompt": prompt,
-                "raw_response": raw_response,
-                "epoch": epoch,
-                "phase": phase,
-                "model": self.model_name,
-                "status": eval_res.get("status"),
-                "error": eval_res.get("error"),
-            }
-            samples.append(sample)
+            # --- 3. Evaluate code in parallel (ThreadPool) ---
+            # Each _evaluate_one_standalone spawns its own subprocess via multiprocessing,
+            # so ThreadPool is correct here (avoids nested ProcessPool deadlocks).
+            batch_eval_results: List[Dict[str, Any]] = [{}] * batch_len
 
-            if update_memory:
-                meta = {
-                    "source_benchmark": "bigcodebench",
-                    "success": bool(ok),
-                    # Fields used by memory_rl prompt formatting
-                    "task_id": task_id,
-                    "outcome": "success" if ok else "failure",
-                    "outcome_success": bool(ok),
-                    "entry_point": str(task.get("entry_point", "")) if isinstance(task, dict) else "",
-                    "libs": (task.get("libs") if isinstance(task, dict) else None),
-                    "source": "conversation",
-                    "eval_status": eval_res.get("status"),
-                    "eval_error": eval_res.get("error"),
-                    "bcb_epoch": epoch,
-                    "phase": phase,
-                    "model": self.model_name,
-                }
-                retrieval_for_traj = None
-                if selected_ids or retrieval_trace:
-                    retrieval_for_traj = {
-                        "selected_ids": list(selected_ids),
-                        "num_retrieved": len(selected_ids),
-                        "trace": retrieval_trace,
-                    }
-                pending_task_descriptions.append(prompt)
-                pending_trajectories.append(
-                    self._trajectory_from_raw_or_fallback(
-                        raw_response=raw_response,
-                        prompt=prompt,
-                        code=code,
-                        eval_res=eval_res,
-                        retrieval=retrieval_for_traj,
+            eval_futures = {}
+            with ThreadPoolExecutor(max_workers=eval_workers) as eval_pool:
+                for i, task_id in enumerate(batch_ids):
+                    task = self._problems[task_id]
+                    fut = eval_pool.submit(
+                        _evaluate_one_standalone,
+                        task_id=str(task.get("task_id", "unknown")),
+                        entry_point=str(task.get("entry_point", "task_func")),
+                        test_code=str(task.get("test", "") or ""),
+                        code=batch_codes[i],
+                        eval_timeout_s=self.eval_timeout_s,
+                        hard_timeout_s=self.untrusted_hard_timeout_s,
+                        bcb_repo=self.bcb_repo,
                     )
-                )
-                pending_successes.append(bool(ok))
-                pending_retrieved_ids.append(list(selected_ids))
-                pending_retrieved_queries.append(retrieved_topk_queries)
-                pending_metadatas.append(meta)
-                if len(pending_task_descriptions) >= 25:
-                    _flush_memory_updates(step_idx=(epoch - 1) * max(total, 1) + idx)
+                    eval_futures[fut] = i
+                for fut in as_completed(eval_futures):
+                    i = eval_futures[fut]
+                    try:
+                        batch_eval_results[i] = fut.result()
+                    except Exception as e:
+                        batch_eval_results[i] = {"task_id": batch_ids[i], "status": "ERROR", "error": str(e)}
 
-            if idx % 25 == 0 or idx == total:
-                logger.info("[bcb] epoch %d %s %d/%d pass=%d", epoch, phase, idx, total, pass_count)
-                # TensorBoard scalars (throttled to the same cadence).
-                step = (epoch - 1) * max(total, 1) + idx
-                self._tb_add_scalar(f"bcb/{phase}/processed", idx, step=step)
-                self._tb_add_scalar(f"bcb/{phase}/pass", pass_count, step=step)
-                self._tb_add_scalar(
-                    f"bcb/{phase}/pass_at_1",
-                    (pass_count / float(idx)) if idx else 0.0,
-                    step=step,
-                )
+            # --- 4. Collect results & queue memory updates ---
+            for i, task_id in enumerate(batch_ids):
+                idx = batch_start + i + 1  # 1-based global index
+                task = self._problems[task_id]
+                prompt = batch_prompts[i]
+                raw_response = batch_raw_responses[i]
+                code = batch_codes[i]
+                eval_res = batch_eval_results[i]
+                sel_ids = batch_selected_ids[i]
+                topk_q = batch_topk_queries[i]
+                r_trace = batch_retrieval_traces[i]
+
+                ok = eval_res.get("status") == "PASS"
+                pass_count += 1 if ok else 0
 
                 if self.retrieve_k > 0:
-                    denom = max(1, tb_window_tasks)
-                    self._tb_add_scalar(
-                        f"bcb/{phase}/retrieved_count_avg",
-                        tb_retrieved_sum / float(denom),
-                        step=step,
-                    )
-                    self._tb_add_scalar(
-                        f"bcb/{phase}/simmax_avg",
-                        tb_simmax_sum / float(denom),
-                        step=step,
-                    )
-                    tb_window_tasks = 0
-                    tb_retrieved_sum = 0
-                    tb_simmax_sum = 0.0
+                    tb_window_tasks += 1
+                    tb_retrieved_sum += int(len(sel_ids))
+                    try:
+                        tb_simmax_sum += float(r_trace.get("simmax", 0.0) or 0.0)
+                    except Exception:
+                        pass
 
-        _flush_memory_updates(step_idx=(epoch - 1) * max(total, 1) + total)
+                retrieval_logs.append({
+                    "task_id": task_id, "epoch": epoch, "phase": phase,
+                    "selected_ids": sel_ids, "retrieved_topk_queries": topk_q,
+                    "threshold": self._get_retrieve_threshold(),
+                })
+
+                samples.append({
+                    "task_id": task_id, "solution": code, "prompt": prompt,
+                    "raw_response": raw_response, "epoch": epoch, "phase": phase,
+                    "model": self.model_name, "status": eval_res.get("status"),
+                    "error": eval_res.get("error"),
+                })
+
+                if update_memory:
+                    meta = {
+                        "source_benchmark": "bigcodebench", "success": bool(ok),
+                        "task_id": task_id, "outcome": "success" if ok else "failure",
+                        "outcome_success": bool(ok),
+                        "entry_point": str(task.get("entry_point", "")) if isinstance(task, dict) else "",
+                        "libs": (task.get("libs") if isinstance(task, dict) else None),
+                        "source": "conversation", "eval_status": eval_res.get("status"),
+                        "eval_error": eval_res.get("error"), "bcb_epoch": epoch,
+                        "phase": phase, "model": self.model_name,
+                    }
+                    retrieval_for_traj = None
+                    if sel_ids or r_trace:
+                        retrieval_for_traj = {
+                            "selected_ids": list(sel_ids),
+                            "num_retrieved": len(sel_ids),
+                            "trace": r_trace,
+                        }
+                    pending_task_descriptions.append(prompt)
+                    pending_trajectories.append(
+                        self._trajectory_from_raw_or_fallback(
+                            raw_response=raw_response, prompt=prompt,
+                            code=code, eval_res=eval_res, retrieval=retrieval_for_traj,
+                        )
+                    )
+                    pending_successes.append(bool(ok))
+                    pending_retrieved_ids.append(list(sel_ids))
+                    pending_retrieved_queries.append(topk_q)
+                    pending_metadatas.append(meta)
+
+            # --- 5. Flush memory & log progress ---
+            global_idx = batch_start + batch_len
+            _flush_memory_updates(step_idx=(epoch - 1) * max(total, 1) + global_idx)
+
+            logger.info("[bcb] epoch %d %s %d/%d pass=%d", epoch, phase, global_idx, total, pass_count)
+            step = (epoch - 1) * max(total, 1) + global_idx
+            self._tb_add_scalar(f"bcb/{phase}/processed", global_idx, step=step)
+            self._tb_add_scalar(f"bcb/{phase}/pass", pass_count, step=step)
+            self._tb_add_scalar(
+                f"bcb/{phase}/pass_at_1",
+                (pass_count / float(global_idx)) if global_idx else 0.0,
+                step=step,
+            )
+            if self.retrieve_k > 0:
+                denom = max(1, tb_window_tasks)
+                self._tb_add_scalar(f"bcb/{phase}/retrieved_count_avg", tb_retrieved_sum / float(denom), step=step)
+                self._tb_add_scalar(f"bcb/{phase}/simmax_avg", tb_simmax_sum / float(denom), step=step)
+                tb_window_tasks = 0
+                tb_retrieved_sum = 0
+                tb_simmax_sum = 0.0
 
         samples_path = os.path.join(phase_dir, "samples.jsonl")
         write_samples(samples, samples_path)
@@ -729,8 +813,8 @@ class BCBRunner:
             os.makedirs(epoch_dir, exist_ok=True)
 
             # Epoch lifecycle: expire stale memories and enforce budget
-            if hasattr(self.memsvc, "begin_epoch"):
-                lifecycle = self.memsvc.begin_epoch(epoch)
+            if hasattr(self.mem, "begin_epoch"):
+                lifecycle = self.mem.begin_epoch(epoch)
                 if lifecycle.get("expired", 0) > 0 or lifecycle.get("evicted", 0) > 0:
                     logger.info(f"Epoch lifecycle: {lifecycle}")
 
