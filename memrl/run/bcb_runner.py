@@ -532,7 +532,9 @@ class BCBRunner:
         # ── Batched parallel execution ────────────────────────────────
         BATCH = 25
         _cpus = os.cpu_count() or 4
-        eval_workers = min(BATCH, max(4, _cpus // 4))
+        # eval forks subprocesses — cap at 12 to avoid OOM / semaphore leaks
+        eval_workers = min(12, max(4, _cpus // 8))
+        # gen is just HTTP calls to vLLM, can be more aggressive
         gen_workers = min(BATCH, max(4, _cpus // 4))
 
         for batch_start in range(0, total, BATCH):
