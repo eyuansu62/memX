@@ -115,6 +115,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retrieve_k", type=int, default=None)
     p.add_argument("--eval_timeout", type=float, default=60.0)
     p.add_argument("--untrusted_hard_timeout", type=float, default=120.0)
+    p.add_argument("--resume", type=str, default=None,
+        help="Path to a previous run directory to resume from (loads latest checkpoint)")
     return p.parse_args()
 
 
@@ -264,6 +266,7 @@ def main() -> None:
         bcb_repo=args.bcb_repo,
         untrusted_hard_timeout_s=float(args.untrusted_hard_timeout),
         eval_timeout_s=float(args.eval_timeout),
+        resume_dir=args.resume,
     )
 
     logger.info("BCB run_dir: %s", run_dir)

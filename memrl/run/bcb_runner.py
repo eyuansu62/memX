@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -133,6 +134,7 @@ class BCBRunner:
         bcb_repo: Optional[str] = None,
         untrusted_hard_timeout_s: float = 120.0,
         eval_timeout_s: float = 60.0,
+        resume_dir: Optional[str] = None,
     ) -> None:
         self.root = Path(root)
         self.sel = selection
@@ -154,6 +156,7 @@ class BCBRunner:
         self.bcb_repo = bcb_repo
         self.untrusted_hard_timeout_s = float(untrusted_hard_timeout_s)
         self.eval_timeout_s = float(eval_timeout_s)
+        self.resume_dir = resume_dir
 
         ensure_bigcodebench_on_path(self.bcb_repo)
 
@@ -754,7 +757,29 @@ class BCBRunner:
         self._save_json(os.path.join(self.output_dir, "run_config.json"), run_cfg)
 
         epoch_summaries: List[Dict[str, Any]] = []
-        for epoch in range(1, self.num_epochs + 1):
+
+        # ── Resume from checkpoint ───────────────────────────────────
+        start_epoch = 1
+        if self.resume_dir and os.path.isdir(self.resume_dir):
+            for e in range(self.num_epochs, 0, -1):
+                summary_path = os.path.join(self.resume_dir, f"epoch{e}", "epoch_summary.json")
+                if os.path.isfile(summary_path):
+                    snapshot_dir = os.path.join(self.resume_dir, f"epoch{e}", "snapshot")
+                    self.mem.load_checkpoint_snapshot(snapshot_dir)
+                    start_epoch = e + 1
+                    logger.info("Resumed from epoch %d checkpoint, starting at epoch %d", e, start_epoch)
+                    for prev_e in range(1, e + 1):
+                        src = os.path.join(self.resume_dir, f"epoch{prev_e}")
+                        dst = os.path.join(self.output_dir, f"epoch{prev_e}")
+                        if os.path.isdir(src) and not os.path.isdir(dst):
+                            shutil.copytree(src, dst)
+                        prev_summary_path = os.path.join(src, "epoch_summary.json")
+                        if os.path.isfile(prev_summary_path):
+                            with open(prev_summary_path, "r") as f:
+                                epoch_summaries.append(json.load(f))
+                    break
+
+        for epoch in range(start_epoch, self.num_epochs + 1):
             epoch_dir = os.path.join(self.output_dir, f"epoch{epoch}")
             os.makedirs(epoch_dir, exist_ok=True)
 
